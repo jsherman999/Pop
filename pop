@@ -7,15 +7,60 @@ set -e
 # Default values
 OUTPUT="script.py"
 LANG=""
-MODEL=""
+MODEL="qwen3:latest"
 INPUT_FILE=""
 PROMPT=""
+HIDE_THINKING=true  # Hide thinking by default
+POP_DIR="$HOME/.pop"
+SESSIONS_DIR="$POP_DIR/sessions"
+ACTIVE_DIR="$POP_DIR/active"
+
+# Function to get incremental output filename
+get_output_filename() {
+    local base_output="$1"
+    local output="$base_output"
+    local counter=1
+
+    # If file doesn't exist, use it as-is
+    if [ ! -f "$output" ]; then
+        echo "$output"
+        return
+    fi
+
+    # Extract directory, basename, and extension
+    local dir=$(dirname "$output")
+    local filename=$(basename "$output")
+    local name="${filename%.*}"
+    local ext="${filename##*.}"
+
+    # If no extension (e.g., "script"), treat whole name as basename
+    if [ "$name" = "$ext" ]; then
+        ext=""
+    fi
+
+    # Find available filename
+    while [ -f "$output" ]; do
+        if [ -n "$ext" ]; then
+            output="${dir}/${name}-${counter}.${ext}"
+        else
+            output="${dir}/${filename}-${counter}"
+        fi
+        ((counter++))
+    done
+
+    echo "$output"
+}
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+# Create pop directories if they don't exist
+mkdir -p "$SESSIONS_DIR" "$ACTIVE_DIR"
 
 # Function to show usage
 show_usage() {
@@ -25,11 +70,16 @@ Usage: pop [options] [prompt]
 Generate code using Ollama models and extract it to executable files.
 
 Options:
-  -m MODEL        Select Ollama model (default: interactive selection)
+  -m MODEL        Select Ollama model (default: qwen3:latest)
   -f FILE         Read prompt from file
   -o OUTPUT       Output file path (default: script.py)
   -l LANG         Language filter for code extraction (python, bash, etc.)
+  --thinking      Show model thinking process (hidden by default)
+  --hidethinking  Explicitly hide model thinking process (default behavior)
   -h              Show this help message
+
+Commands:
+  pop list        Show all active and past pop sessions
 
 Input Methods:
   1. Command-line argument: pop "write a script..."
@@ -44,14 +94,97 @@ Examples:
   cat requirements.txt | pop "create a script from these requirements"
 
 Model Selection:
-  Without -m flag, you'll be prompted to select from available models.
-  Use -m to specify a model directly from: ollama list
+  Without -m flag, defaults to qwen3:latest.
+  Use -m to specify a different model from: ollama list
 
 Output Files:
   - Your script file (executable)
-  - /tmp/pop-response.txt (full LLM response)
+  - Session logs in ~/.pop/sessions/
 EOF
 }
+
+# Function to list sessions
+list_sessions() {
+    echo -e "${CYAN}=== Active Sessions ===${NC}"
+
+    local active_count=0
+    if [ -d "$ACTIVE_DIR" ] && [ "$(ls -A "$ACTIVE_DIR" 2>/dev/null)" ]; then
+        for session_file in "$ACTIVE_DIR"/*.session; do
+            if [ -f "$session_file" ]; then
+                local session_id=$(basename "$session_file" .session)
+                local pid=$(cat "$session_file")
+
+                if kill -0 "$pid" 2>/dev/null; then
+                    # Process is still running
+                    local session_meta="$SESSIONS_DIR/$session_id.meta"
+                    if [ -f "$session_meta" ]; then
+                        source "$session_meta"
+                        echo -e "${GREEN}● ${NC}$session_id (PID: $pid)"
+                        echo -e "  Started: $START_TIME"
+                        echo -e "  Model: $MODEL_NAME"
+                        echo -e "  Output: $OUTPUT_FILE"
+                        echo -e "  Prompt: ${PROMPT_TEXT:0:60}..."
+                        echo ""
+                    fi
+                    ((active_count++))
+                else
+                    # Process finished, clean up
+                    rm -f "$session_file"
+                fi
+            fi
+        done
+    fi
+
+    if [ $active_count -eq 0 ]; then
+        echo -e "${YELLOW}No active sessions${NC}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}=== Past Sessions (Last 20) ===${NC}"
+
+    local past_count=0
+    if [ -d "$SESSIONS_DIR" ]; then
+        # List sessions sorted by timestamp, most recent first
+        for meta_file in $(ls -t "$SESSIONS_DIR"/*.meta 2>/dev/null | head -20); do
+            if [ -f "$meta_file" ]; then
+                source "$meta_file"
+                local session_id=$(basename "$meta_file" .meta)
+
+                # Check if this session is active
+                if [ -f "$ACTIVE_DIR/$session_id.session" ]; then
+                    continue  # Skip active sessions (already shown above)
+                fi
+
+                local status_icon="✓"
+                local status_color="$GREEN"
+                if [ "$STATUS" = "failed" ]; then
+                    status_icon="✗"
+                    status_color="$RED"
+                fi
+
+                echo -e "${status_color}${status_icon}${NC} $session_id"
+                echo -e "  Time: $START_TIME → $END_TIME"
+                echo -e "  Model: $MODEL_NAME"
+                echo -e "  Output: $OUTPUT_FILE"
+                echo -e "  Prompt: ${PROMPT_TEXT:0:60}..."
+                echo -e "  Log: $SESSIONS_DIR/$session_id.log"
+                echo ""
+                ((past_count++))
+            fi
+        done
+    fi
+
+    if [ $past_count -eq 0 ]; then
+        echo -e "${YELLOW}No past sessions${NC}"
+    fi
+
+    exit 0
+}
+
+# Check if first argument is "list"
+if [ "$1" = "list" ]; then
+    list_sessions
+fi
 
 # Function to list and select model
 select_model() {
@@ -87,6 +220,31 @@ select_model() {
 }
 
 # Parse command-line arguments
+# First handle long options
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --hidethinking)
+            HIDE_THINKING=true
+            shift
+            ;;
+        --thinking)
+            HIDE_THINKING=false
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Then handle short options
 while getopts "m:f:o:l:h" opt; do
     case $opt in
         m) MODEL="$OPTARG" ;;
@@ -133,11 +291,6 @@ if [ -z "$PROMPT" ]; then
     exit 1
 fi
 
-# Select model if not specified
-if [ -z "$MODEL" ]; then
-    MODEL=$(select_model)
-fi
-
 # Verify model exists
 if ! ollama list | grep -q "^$MODEL"; then
     echo -e "${RED}✗ Model not found: $MODEL${NC}" >&2
@@ -146,26 +299,107 @@ if ! ollama list | grep -q "^$MODEL"; then
     exit 1
 fi
 
-# Generate code
-echo -e "${GREEN}Generating code with $MODEL...${NC}" >&2
+# Generate unique session ID
+SESSION_ID="pop-$(date +%Y%m%d-%H%M%S)-$$"
+SESSION_LOG="$SESSIONS_DIR/$SESSION_ID.log"
+SESSION_META="$SESSIONS_DIR/$SESSION_ID.meta"
+SESSION_ACTIVE="$ACTIVE_DIR/$SESSION_ID.session"
 
-# Build extract-code.py command
-EXTRACT_CMD="/Users/jay/extract-code.py"
-if [ -n "$LANG" ]; then
-    EXTRACT_CMD="$EXTRACT_CMD --lang $LANG"
-fi
+# Save session metadata
+cat > "$SESSION_META" << EOF
+START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+MODEL_NAME="$MODEL"
+OUTPUT_FILE="$OUTPUT"
+PROMPT_TEXT="$PROMPT"
+STATUS="running"
+END_TIME=""
+EOF
 
-# Run ollama and extract code
-if ollama run "$MODEL" "$PROMPT" | tee /tmp/pop-response.txt | $EXTRACT_CMD > "$OUTPUT"; then
-    if [ -s "$OUTPUT" ]; then
-        chmod +x "$OUTPUT"
-        echo -e "${GREEN}✓ Script saved to: $OUTPUT${NC}" >&2
-        echo -e "${GREEN}✓ Full response: /tmp/pop-response.txt${NC}" >&2
-    else
-        echo -e "${RED}✗ No code extracted. Check /tmp/pop-response.txt${NC}" >&2
-        exit 1
+# Background process function
+run_generation() {
+    local session_id="$1"
+    local model="$2"
+    local prompt="$3"
+    local output="$4"
+    local lang="$5"
+    local log="$6"
+    local meta="$7"
+    local active="$8"
+    local hide_thinking="$9"
+
+    # Write session header to log
+    {
+        echo "=== pop Session: $session_id ==="
+        echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Model: $model"
+        echo "Output: $output"
+        echo "Prompt: $prompt"
+        echo ""
+        echo "=== Generation Output ==="
+    } >> "$log"
+
+    # Build extract-code.py command
+    EXTRACT_CMD="/Users/jay/extract-code.py"
+    if [ -n "$lang" ]; then
+        EXTRACT_CMD="$EXTRACT_CMD --lang $lang"
     fi
-else
-    echo -e "${RED}✗ Code generation failed${NC}" >&2
-    exit 1
-fi
+
+    # Build ollama options array
+    local ollama_opts=()
+    if [ "$hide_thinking" = "true" ]; then
+        ollama_opts+=(--hidethinking)
+    fi
+
+    # Run ollama and extract code
+    local status="success"
+    if ollama run "${ollama_opts[@]}" "$model" "$prompt" | tee -a "$log" | $EXTRACT_CMD > "$output"; then
+        if [ -s "$output" ]; then
+            chmod +x "$output"
+            echo "" >> "$log"
+            echo "=== Result ===" >> "$log"
+            echo "✓ Script saved to: $output" >> "$log"
+            echo "✓ Session log: $log" >> "$log"
+        else
+            echo "" >> "$log"
+            echo "✗ No code extracted. Check log for details." >> "$log"
+            status="failed"
+        fi
+    else
+        echo "" >> "$log"
+        echo "✗ Code generation failed" >> "$log"
+        status="failed"
+    fi
+
+    # Update metadata with completion status
+    local end_time="$(date '+%Y-%m-%d %H:%M:%S')"
+    sed -i.bak "s/STATUS=\"running\"/STATUS=\"$status\"/" "$meta"
+    sed -i.bak "s/END_TIME=\"\"/END_TIME=\"$end_time\"/" "$meta"
+    rm -f "$meta.bak"
+
+    # Remove from active sessions
+    rm -f "$active"
+}
+
+# Get incremental output filename to avoid overwriting
+OUTPUT=$(get_output_filename "$OUTPUT")
+
+# Update metadata with final output filename
+sed -i.bak "s|OUTPUT_FILE=\".*\"|OUTPUT_FILE=\"$OUTPUT\"|" "$SESSION_META"
+rm -f "$SESSION_META.bak"
+
+# Start background generation
+run_generation "$SESSION_ID" "$MODEL" "$PROMPT" "$OUTPUT" "$LANG" "$SESSION_LOG" "$SESSION_META" "$SESSION_ACTIVE" "$HIDE_THINKING" &
+
+# Get the background process PID and save to active session file
+BG_PID=$!
+echo "$BG_PID" > "$SESSION_ACTIVE"
+
+# Inform user
+echo -e "${GREEN}✓ pop session started: ${BLUE}$SESSION_ID${NC}"
+echo -e "${GREEN}✓ Model: ${BLUE}$MODEL${NC}"
+echo -e "${GREEN}✓ Output will be saved to: ${BLUE}$OUTPUT${NC}"
+echo -e "${GREEN}✓ Session log: ${BLUE}$SESSION_LOG${NC}"
+echo ""
+echo -e "${YELLOW}Generation running in background (PID: $BG_PID)${NC}"
+echo -e "${YELLOW}Use 'pop list' to check session status${NC}"
+echo -e "${YELLOW}Use 'tail -f $SESSION_LOG' to follow progress${NC}"

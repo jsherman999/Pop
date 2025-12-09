@@ -6,6 +6,14 @@ A flexible wrapper script for generating code using any Ollama model and automat
 
 **pop** (Prompt-Oriented Programming) is a command-line tool that bridges the gap between natural language prompts and executable code. It leverages Ollama's local LLMs to generate scripts in any language and automatically extracts clean code from the AI's response.
 
+### Key Features
+
+- **Background Execution**: Runs in the background, returning your shell immediately
+- **Session Tracking**: Saves all sessions with full logs and metadata
+- **Default Model**: Uses `qwen3:latest` by default (configurable with `-m` flag)
+- **Session Management**: View active and past sessions with `pop list`
+- **Multiple Input Methods**: Command-line, file input, or stdin/pipe support
+
 ## Installation
 
 The script is located at `/Users/jay/cc_projects/pop/pop`.
@@ -49,11 +57,17 @@ pop [options] [prompt]
 
 | Option | Description |
 |--------|-------------|
-| `-m MODEL` | Select Ollama model (default: interactive selection) |
+| `-m MODEL` | Select Ollama model (default: qwen3:latest) |
 | `-f FILE` | Read prompt from file |
 | `-o OUTPUT` | Output file path (default: script.py) |
 | `-l LANG` | Language filter for code extraction (python, bash, etc.) |
 | `-h` | Show help message |
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `pop list` | Show all active and past pop sessions on this host |
 
 ### Input Methods
 
@@ -77,12 +91,13 @@ pop [options] [prompt]
 
 ## Quick Start Examples
 
-### Basic Usage (Interactive Model Selection)
+### Basic Usage (Uses qwen3:latest by default)
 
 ```bash
-# You'll be prompted to select a model
+# Uses default model (qwen3:latest)
 pop "write a python script that lists all files in current directory"
-# Creates: script.py
+# Runs in background, creates: script.py
+# Returns shell immediately
 ```
 
 ### With Model Selection
@@ -125,27 +140,80 @@ Write a simple HTTP server that:
 EOF
 ```
 
-## Model Selection
+## Session Management
 
-### Interactive Selection (Default)
+### Background Execution
 
-When you don't specify `-m`, **pop** shows your installed models:
+**pop** now runs all code generation in the background, returning your shell immediately:
 
 ```bash
-$ pop "write a hello world script"
-Available Ollama models:
-  1) llama3.2:latest
-  2) codellama:latest
-  3) qwen2.5-coder:latest
-  4) mistral:latest
-Select model (1-4): 3
-Generating code with qwen2.5-coder:latest...
+$ pop "write a complex web scraper"
+✓ pop session started: pop-20251208-143055-12345
+✓ Model: qwen3:latest
+✓ Output will be saved to: script.py
+✓ Session log: /Users/jay/.pop/sessions/pop-20251208-143055-12345.log
+
+Generation running in background (PID: 12345)
+Use 'pop list' to check session status
+Use 'tail -f /Users/jay/.pop/sessions/pop-20251208-143055-12345.log' to follow progress
+$
+# Shell is immediately available!
 ```
 
-### Direct Model Selection
+### Viewing Sessions
+
+Use `pop list` to see all active and past sessions:
 
 ```bash
-# Skip selection by specifying model
+$ pop list
+
+=== Active Sessions ===
+● pop-20251208-143055-12345 (PID: 12345)
+  Started: 2025-12-08 14:30:55
+  Model: qwen3:latest
+  Output: script.py
+  Prompt: write a complex web scraper...
+
+=== Past Sessions (Last 20) ===
+✓ pop-20251208-142012-12234
+  Time: 2025-12-08 14:20:12 → 2025-12-08 14:21:45
+  Model: qwen3:latest
+  Output: csvparser.py
+  Prompt: write a csv parser with filtering...
+  Log: /Users/jay/.pop/sessions/pop-20251208-142012-12234.log
+
+✗ pop-20251208-141500-12100
+  Time: 2025-12-08 14:15:00 → 2025-12-08 14:15:30
+  Model: codellama:latest
+  Output: test.py
+  Prompt: write a unit test framework...
+  Log: /Users/jay/.pop/sessions/pop-20251208-141500-12100.log
+```
+
+### Monitoring Progress
+
+```bash
+# Follow a session in real-time
+tail -f ~/.pop/sessions/pop-20251208-143055-12345.log
+
+# Check if output file is ready
+ls -lh script.py
+```
+
+## Model Selection
+
+### Default Model
+
+By default, **pop** uses `qwen3:latest`. No selection needed:
+
+```bash
+pop "write a script"  # Uses qwen3:latest automatically
+```
+
+### Custom Model Selection
+
+```bash
+# Specify a different model
 pop -m codellama "write a recursive file finder" -o find.py
 
 # Use specific model versions
@@ -283,27 +351,39 @@ cat error.log | pop "analyze these errors and write a fix script"
 echo "Base requirement: web scraper" | pop "Add: rate limiting, robots.txt respect, error recovery" -o scraper.py
 ```
 
-## Output Files
+## Output Files and Logs
 
 When you run **pop**, it creates:
 
 1. **Your script file** - Extracted code, executable (`chmod +x`)
-2. **`/tmp/pop-response.txt`** - Full LLM response with explanations
+2. **Session log** - `~/.pop/sessions/<session-id>.log` - Full LLM response
+3. **Session metadata** - `~/.pop/sessions/<session-id>.meta` - Session info
 
-### Example Session
+### Session Files
+
+All sessions are saved in `~/.pop/sessions/`:
 
 ```bash
-$ pop -m qwen2.5-coder "write a port scanner" -o portscan.py
+$ ls ~/.pop/sessions/
+pop-20251208-143055-12345.log   # Full generation output
+pop-20251208-143055-12345.meta  # Session metadata
 
-Generating code with qwen2.5-coder:latest...
-✓ Script saved to: portscan.py
-✓ Full response: /tmp/pop-response.txt
+$ cat ~/.pop/sessions/pop-20251208-143055-12345.meta
+START_TIME="2025-12-08 14:30:55"
+MODEL_NAME="qwen3:latest"
+OUTPUT_FILE="script.py"
+PROMPT_TEXT="write a complex web scraper"
+STATUS="success"
+END_TIME="2025-12-08 14:32:10"
+```
 
-$ ls -l portscan.py
--rwxr-xr-x  1 jay  staff  2341 Dec  8 22:15 portscan.py
+### Active Session Tracking
 
-$ head /tmp/pop-response.txt
-# Full LLM response with explanations, usage examples, etc.
+Active sessions are tracked in `~/.pop/active/`:
+
+```bash
+$ ls ~/.pop/active/
+pop-20251208-143055-12345.session  # Contains PID of running process
 ```
 
 ## Tips & Best Practices
@@ -334,33 +414,53 @@ pop "write a case converter: 'hello_world' -> 'HelloWorld', 'camelCase' -> 'came
 
 ### 4. Choose the Right Model
 
+- **qwen3:latest** - Default, fast and capable (recommended)
 - **codellama** - Best for code generation
 - **qwen2.5-coder** - Excellent for complex algorithms
 - **llama3.2** - Good general-purpose model
 - **mistral** - Fast and efficient for simpler tasks
 
-### 5. Review Before Running
+### 5. Monitor Active Sessions
 
-Always check `/tmp/pop-response.txt` for:
+```bash
+# Check status of all sessions
+pop list
+
+# Follow a specific session
+tail -f ~/.pop/sessions/<session-id>.log
+
+# List all session logs
+ls -lh ~/.pop/sessions/*.log
+```
+
+### 6. Review Before Running
+
+Always check session logs for:
 - Security considerations
 - Dependencies to install (`pip install`, `npm install`, etc.)
 - Usage examples and documentation from the LLM
 - Edge cases and limitations
 
-### 6. Handle Dependencies
+```bash
+# View latest session log
+cat ~/.pop/sessions/$(ls -t ~/.pop/sessions/*.log | head -1)
+```
+
+### 7. Handle Dependencies
 
 ```bash
 # Generate script
 pop "write a web scraper using BeautifulSoup" -o scraper.py
 
-# Check response for dependencies
-grep -i "pip install\|import" /tmp/pop-response.txt
+# Wait for completion, then check log for dependencies
+pop list  # Check if session is complete
+grep -i "pip install\|import" ~/.pop/sessions/pop-*.log | tail -20
 
 # Install dependencies
 pip install beautifulsoup4 requests lxml
 ```
 
-### 7. Use Language Filters Wisely
+### 8. Use Language Filters Wisely
 
 ```bash
 # Extract specific language when LLM provides multiple
@@ -372,9 +472,15 @@ pop "write both Python and Bash versions of a log parser" -o parser.sh -l bash
 
 ### No Code Extracted
 
-If you see:
-```
-✗ No code extracted. Check /tmp/pop-response.txt
+If a session shows "failed" status in `pop list`:
+
+**Check the session log:**
+```bash
+# Find the failed session
+pop list
+
+# View the log
+cat ~/.pop/sessions/<session-id>.log
 ```
 
 **Possible causes:**
@@ -388,13 +494,13 @@ If you see:
 pop "your prompt" -o output.py
 
 # Check full response
-cat /tmp/pop-response.txt
+cat ~/.pop/sessions/<session-id>.log
 
 # Extract manually with different language
-/Users/jay/extract-code.py /tmp/pop-response.txt --lang sh > output.sh
+/Users/jay/extract-code.py ~/.pop/sessions/<session-id>.log --lang sh > output.sh
 
 # Extract all code blocks
-/Users/jay/extract-code.py /tmp/pop-response.txt --all > output.py
+/Users/jay/extract-code.py ~/.pop/sessions/<session-id>.log --all > output.py
 ```
 
 ### Model Not Found
@@ -429,6 +535,19 @@ echo "write a hello world script" | pop -o hello.py
 
 # Check if stdin has content
 cat myfile.txt | tee /dev/stderr | pop -o output.py
+```
+
+### Checking Session Status
+
+```bash
+# View all sessions
+pop list
+
+# Monitor specific session progress
+tail -f ~/.pop/sessions/<session-id>.log
+
+# Check if a session is still running
+ps aux | grep ollama
 ```
 
 ### Permission Issues
@@ -628,6 +747,16 @@ Found a bug or have a feature request? Open an issue or submit a pull request.
 - [Prompt Engineering Guide](https://www.promptingguide.ai/)
 
 ## Changelog
+
+### v3.0 - Background Execution & Session Management
+- **Background execution**: All code generation runs in background, returns shell immediately
+- **Session tracking**: All sessions saved to `~/.pop/sessions/` with logs and metadata
+- **Default model**: Now defaults to `qwen3:latest` (no interactive selection needed)
+- **`pop list` command**: View all active and past sessions on host
+- **Active session tracking**: Track running sessions in `~/.pop/active/`
+- Session logs include timestamps, model info, prompts, and full LLM output
+- Status tracking (success/failed) for all sessions
+- Improved user experience with immediate shell return
 
 ### v2.0 - "pop" rename
 - Renamed from `ai-script` to `pop` (Prompt-Oriented Programming)
