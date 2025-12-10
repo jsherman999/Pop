@@ -11,6 +11,7 @@ MODEL="qwen3:latest"
 INPUT_FILE=""
 PROMPT=""
 HIDE_THINKING=true  # Hide thinking by default
+MINIMAL_MODE=false  # Minimal mode disabled by default
 POP_DIR="$HOME/.pop"
 SESSIONS_DIR="$POP_DIR/sessions"
 ACTIVE_DIR="$POP_DIR/active"
@@ -74,6 +75,7 @@ Options:
   -f FILE         Read prompt from file
   -o OUTPUT       Output file path (default: script.py)
   -l LANG         Language filter for code extraction (python, bash, etc.)
+  --minimal       Enable minimal mode (strongest prompts + strip comments)
   --thinking      Show model thinking process (hidden by default)
   --hidethinking  Explicitly hide model thinking process (default behavior)
   -h              Show this help message
@@ -223,6 +225,10 @@ select_model() {
 # First handle long options
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --minimal)
+            MINIMAL_MODE=true
+            shift
+            ;;
         --hidethinking)
             HIDE_THINKING=true
             shift
@@ -326,6 +332,7 @@ run_generation() {
     local meta="$7"
     local active="$8"
     local hide_thinking="$9"
+    local minimal_mode="${10}"
 
     # Write session header to log
     {
@@ -338,10 +345,14 @@ run_generation() {
         echo "=== Generation Output ==="
     } >> "$log"
 
-    # Build extract-code.py command
-    EXTRACT_CMD="/Users/jay/extract-code.py"
+    # Build extract-code.py command (use script directory)
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    EXTRACT_CMD="$SCRIPT_DIR/extract-code.py"
     if [ -n "$lang" ]; then
         EXTRACT_CMD="$EXTRACT_CMD --lang $lang"
+    fi
+    if [ "$minimal_mode" = "true" ]; then
+        EXTRACT_CMD="$EXTRACT_CMD --strip-comments"
     fi
 
     # Build ollama options array
@@ -350,9 +361,26 @@ run_generation() {
         ollama_opts+=(--hidethinking)
     fi
 
+    # Build enhanced prompt with clear instructions for clean code
+    if [ "$minimal_mode" = "true" ]; then
+        # Stronger prompt for minimal mode
+        local enhanced_prompt="$prompt
+
+CRITICAL INSTRUCTIONS:
+- Output ONLY executable code in a single code block
+- NO explanations, NO comments, NO documentation
+- NO text before or after the code block
+- Code must be production-ready and executable immediately"
+    else
+        # Standard prompt enhancement
+        local enhanced_prompt="$prompt
+
+IMPORTANT: Respond with ONLY the executable code inside a single code block. No explanations, no comments, no text before or after the code block."
+    fi
+
     # Run ollama and extract code
     local status="success"
-    if ollama run "${ollama_opts[@]}" "$model" "$prompt" | tee -a "$log" | $EXTRACT_CMD > "$output"; then
+    if ollama run "${ollama_opts[@]}" "$model" "$enhanced_prompt" | tee -a "$log" | $EXTRACT_CMD > "$output"; then
         if [ -s "$output" ]; then
             chmod +x "$output"
             echo "" >> "$log"
@@ -388,7 +416,7 @@ sed -i.bak "s|OUTPUT_FILE=\".*\"|OUTPUT_FILE=\"$OUTPUT\"|" "$SESSION_META"
 rm -f "$SESSION_META.bak"
 
 # Start background generation
-run_generation "$SESSION_ID" "$MODEL" "$PROMPT" "$OUTPUT" "$LANG" "$SESSION_LOG" "$SESSION_META" "$SESSION_ACTIVE" "$HIDE_THINKING" &
+run_generation "$SESSION_ID" "$MODEL" "$PROMPT" "$OUTPUT" "$LANG" "$SESSION_LOG" "$SESSION_META" "$SESSION_ACTIVE" "$HIDE_THINKING" "$MINIMAL_MODE" &
 
 # Get the background process PID and save to active session file
 BG_PID=$!
