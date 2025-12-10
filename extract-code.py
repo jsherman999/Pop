@@ -14,6 +14,54 @@ import re
 import ast
 
 
+def ensure_shebang(code: str, language: str = None) -> str:
+    """
+    Ensure code has a valid shebang line at the beginning.
+
+    Args:
+        code: Source code to check
+        language: Programming language (python, bash, javascript, etc.)
+
+    Returns:
+        Code with shebang line if missing
+    """
+    lines = code.split('\n')
+
+    # Check if first line is already a shebang
+    if lines and lines[0].strip().startswith('#!'):
+        return code
+
+    # Detect language if not specified
+    if not language:
+        if 'import ' in code or 'def ' in code or 'class ' in code:
+            language = 'python'
+        elif 'function ' in code or 'const ' in code or 'let ' in code:
+            language = 'javascript'
+        elif 'echo ' in code or '[[' in code or 'if [' in code:
+            language = 'bash'
+
+    # Determine appropriate shebang based on language
+    shebang = None
+    if language in ['python', 'py']:
+        shebang = '#!/usr/bin/env python3'
+    elif language in ['bash', 'sh', 'shell']:
+        shebang = '#!/bin/bash'
+    elif language in ['javascript', 'js', 'node']:
+        shebang = '#!/usr/bin/env node'
+    elif language in ['ruby', 'rb']:
+        shebang = '#!/usr/bin/env ruby'
+    elif language in ['perl', 'pl']:
+        shebang = '#!/usr/bin/env perl'
+    elif language in ['php']:
+        shebang = '#!/usr/bin/env php'
+
+    # Insert shebang if determined
+    if shebang:
+        return f"{shebang}\n{code}"
+
+    return code
+
+
 def strip_comments(code: str, language: str = None) -> str:
     """
     Remove comments from code while preserving functionality.
@@ -99,7 +147,7 @@ def strip_comments(code: str, language: str = None) -> str:
     return code
 
 
-def extract_code_blocks(text: str, language: str = None) -> str:
+def extract_code_blocks(text: str, language: str = None) -> tuple:
     """
     Extract code blocks from markdown-formatted text.
 
@@ -108,7 +156,7 @@ def extract_code_blocks(text: str, language: str = None) -> str:
         language: Optional language filter (e.g., 'python', 'bash')
 
     Returns:
-        Extracted code content
+        Tuple of (extracted code content, detected language)
     """
     # Pattern matches ```language\ncode\n``` blocks
     pattern = r'```(\w+)?\n(.*?)```'
@@ -116,7 +164,7 @@ def extract_code_blocks(text: str, language: str = None) -> str:
 
     if not matches:
         # No code blocks found, return original text
-        return text
+        return (text, language)
 
     # Filter by language if specified
     if language:
@@ -124,10 +172,11 @@ def extract_code_blocks(text: str, language: str = None) -> str:
 
     if not matches:
         sys.stderr.write(f"No code blocks found for language: {language}\n")
-        return ""
+        return ("", language)
 
-    # Return the first matching code block
-    return matches[0][1].strip()
+    # Return the first matching code block and its language
+    detected_lang, code = matches[0]
+    return (code.strip(), detected_lang or language)
 
 
 def main():
@@ -170,12 +219,16 @@ def main():
         if args.lang:
             matches = [(lang, code) for lang, code in matches if lang.lower() == args.lang.lower()]
         code = '\n\n'.join(code.strip() for _, code in matches)
+        detected_lang = args.lang
     else:
-        code = extract_code_blocks(text, args.lang)
+        code, detected_lang = extract_code_blocks(text, args.lang)
+
+    # Ensure shebang is present
+    code = ensure_shebang(code, detected_lang)
 
     # Strip comments if requested
     if args.strip_comments:
-        code = strip_comments(code, args.lang)
+        code = strip_comments(code, detected_lang)
 
     print(code)
 
