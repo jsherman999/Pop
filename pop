@@ -8,13 +8,14 @@ Usage: pop [options] [prompt]
 """
 
 import argparse
+import base64
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
 from datetime import datetime
-from multiprocessing import Process
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -876,7 +877,44 @@ Please respond with the COMPLETE fixed script inside a markdown code block."""
         pass
 
 
+def run_daemon_mode():
+    """Run in daemon mode - called when spawned as background process."""
+    import pickle
+    import base64
+
+    # Read serialized arguments from environment
+    args_data = os.environ.get('POP_DAEMON_ARGS')
+    if not args_data:
+        sys.exit(1)
+
+    try:
+        args = pickle.loads(base64.b64decode(args_data))
+    except:
+        sys.exit(1)
+
+    mode = args['mode']
+    if mode == 'generate':
+        run_generation(
+            args['session_id'], args['model'], args['prompt'], args['output'],
+            args['lang'], args['log_file'], args['meta_file'], args['active_file'],
+            args['hide_thinking'], args['minimal'], args['do_verify'], args['max_retries']
+        )
+    elif mode == 'fix':
+        run_fix(
+            args['session_id'], args['model'], args['prompt'], args['fix_file'],
+            args['output'], args['lang'], args['log_file'], args['meta_file'],
+            args['active_file'], args['hide_thinking'], args['minimal'],
+            args['do_verify'], args['max_retries']
+        )
+    sys.exit(0)
+
+
 def main():
+    # Check for daemon mode first (before anything else)
+    if '--_daemon' in sys.argv:
+        run_daemon_mode()
+        return
+
     ensure_directories()
 
     # Check for commands first
@@ -1015,20 +1053,44 @@ Examples:
             f.write('ATTEMPTS="0"\n')
             f.write('VERIFIED="false"\n')
 
-        # Start background fix process
-        process = Process(
-            target=run_fix,
-            args=(session_id, args.model, prompt, fix_file, output, lang,
-                  str(session_log), str(session_meta), str(session_active),
-                  hide_thinking, args.minimal, do_verify, MAX_RETRIES)
+        # Serialize arguments for daemon process
+        daemon_args = {
+            'mode': 'fix',
+            'session_id': session_id,
+            'model': args.model,
+            'prompt': prompt,
+            'fix_file': fix_file,
+            'output': output,
+            'lang': lang,
+            'log_file': str(session_log),
+            'meta_file': str(session_meta),
+            'active_file': str(session_active),
+            'hide_thinking': hide_thinking,
+            'minimal': args.minimal,
+            'do_verify': do_verify,
+            'max_retries': MAX_RETRIES
+        }
+
+        # Spawn fully detached daemon process with serialized args
+        env = os.environ.copy()
+        env['POP_DAEMON_ARGS'] = base64.b64encode(pickle.dumps(daemon_args)).decode()
+
+        devnull = open(os.devnull, 'r+b')
+        proc = subprocess.Popen(
+            [sys.executable, __file__, '--_daemon'],
+            stdin=devnull,
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+            close_fds=True,
+            env=env
         )
-        process.start()
+        with open(str(session_active), 'w') as f:
+            f.write(str(proc.pid))
+        devnull.close()
+        daemon_pid = proc.pid
 
-        # Save PID to active session file
-        with open(session_active, 'w') as f:
-            f.write(str(process.pid))
-
-        # Inform user
+        # Print info and exit immediately
         print(f"{Colors.GREEN}✓ pop fix session started: {Colors.BLUE}{session_id}{Colors.NC}")
         print(f"{Colors.GREEN}✓ Model: {Colors.BLUE}{args.model}{Colors.NC}")
         print(f"{Colors.GREEN}✓ Fixing: {Colors.BLUE}{fix_file}{Colors.NC}")
@@ -1039,9 +1101,10 @@ Examples:
             print(f"{Colors.YELLOW}✓ Verification: {Colors.BLUE}disabled{Colors.NC}")
         print(f"{Colors.GREEN}✓ Session log: {Colors.BLUE}{session_log}{Colors.NC}")
         print()
-        print(f"{Colors.YELLOW}Fix running in background (PID: {process.pid}){Colors.NC}")
+        print(f"{Colors.YELLOW}Fix running in background (PID: {daemon_pid}){Colors.NC}")
         print(f"{Colors.YELLOW}Use 'pop list' to check session status{Colors.NC}")
         print(f"{Colors.YELLOW}Use 'tail -f {session_log}' to follow progress{Colors.NC}")
+        sys.exit(0)
 
     else:
         # Normal generation mode
@@ -1065,20 +1128,43 @@ Examples:
             f.write('ATTEMPTS="0"\n')
             f.write('VERIFIED="false"\n')
 
-        # Start background generation
-        process = Process(
-            target=run_generation,
-            args=(session_id, args.model, prompt, output, args.lang,
-                  str(session_log), str(session_meta), str(session_active),
-                  hide_thinking, args.minimal, do_verify, MAX_RETRIES)
+        # Serialize arguments for daemon process
+        daemon_args = {
+            'mode': 'generate',
+            'session_id': session_id,
+            'model': args.model,
+            'prompt': prompt,
+            'output': output,
+            'lang': args.lang,
+            'log_file': str(session_log),
+            'meta_file': str(session_meta),
+            'active_file': str(session_active),
+            'hide_thinking': hide_thinking,
+            'minimal': args.minimal,
+            'do_verify': do_verify,
+            'max_retries': MAX_RETRIES
+        }
+
+        # Spawn fully detached daemon process with serialized args
+        env = os.environ.copy()
+        env['POP_DAEMON_ARGS'] = base64.b64encode(pickle.dumps(daemon_args)).decode()
+
+        devnull = open(os.devnull, 'r+b')
+        proc = subprocess.Popen(
+            [sys.executable, __file__, '--_daemon'],
+            stdin=devnull,
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+            close_fds=True,
+            env=env
         )
-        process.start()
+        with open(str(session_active), 'w') as f:
+            f.write(str(proc.pid))
+        devnull.close()
+        daemon_pid = proc.pid
 
-        # Save PID to active session file
-        with open(session_active, 'w') as f:
-            f.write(str(process.pid))
-
-        # Inform user
+        # Print info and exit immediately
         print(f"{Colors.GREEN}✓ pop session started: {Colors.BLUE}{session_id}{Colors.NC}")
         print(f"{Colors.GREEN}✓ Model: {Colors.BLUE}{args.model}{Colors.NC}")
         print(f"{Colors.GREEN}✓ Output will be saved to: {Colors.BLUE}{output}{Colors.NC}")
@@ -1088,9 +1174,10 @@ Examples:
             print(f"{Colors.YELLOW}✓ Verification: {Colors.BLUE}disabled{Colors.NC}")
         print(f"{Colors.GREEN}✓ Session log: {Colors.BLUE}{session_log}{Colors.NC}")
         print()
-        print(f"{Colors.YELLOW}Generation running in background (PID: {process.pid}){Colors.NC}")
+        print(f"{Colors.YELLOW}Generation running in background (PID: {daemon_pid}){Colors.NC}")
         print(f"{Colors.YELLOW}Use 'pop list' to check session status{Colors.NC}")
         print(f"{Colors.YELLOW}Use 'tail -f {session_log}' to follow progress{Colors.NC}")
+        sys.exit(0)
 
 
 if __name__ == '__main__':
