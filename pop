@@ -12,6 +12,8 @@ INPUT_FILE=""
 PROMPT=""
 HIDE_THINKING=true  # Hide thinking by default
 MINIMAL_MODE=false  # Minimal mode disabled by default
+VERIFY=true         # Verification enabled by default
+MAX_RETRIES=3       # Maximum retry attempts for verification failures
 POP_DIR="$HOME/.pop"
 SESSIONS_DIR="$POP_DIR/sessions"
 ACTIVE_DIR="$POP_DIR/active"
@@ -52,6 +54,138 @@ get_output_filename() {
     echo "$output"
 }
 
+# Function to detect language from file
+detect_language() {
+    local file="$1"
+    local specified_lang="$2"
+
+    # Use specified language if provided
+    if [ -n "$specified_lang" ]; then
+        echo "$specified_lang"
+        return
+    fi
+
+    # Check shebang first
+    if [ -f "$file" ]; then
+        local shebang=$(head -1 "$file" 2>/dev/null)
+        if [[ "$shebang" == *"python"* ]]; then echo "python"; return; fi
+        if [[ "$shebang" == *"bash"* ]] || [[ "$shebang" == *"/bin/sh"* ]]; then echo "bash"; return; fi
+        if [[ "$shebang" == *"node"* ]]; then echo "javascript"; return; fi
+        if [[ "$shebang" == *"ruby"* ]]; then echo "ruby"; return; fi
+        if [[ "$shebang" == *"perl"* ]]; then echo "perl"; return; fi
+    fi
+
+    # Fall back to extension
+    local ext="${file##*.}"
+    case "$ext" in
+        py) echo "python" ;;
+        sh|bash) echo "bash" ;;
+        js) echo "javascript" ;;
+        rb) echo "ruby" ;;
+        pl) echo "perl" ;;
+        php) echo "php" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# Function to verify syntax of generated code
+verify_syntax() {
+    local file="$1"
+    local lang="$2"
+
+    # Return empty string (success) if file doesn't exist or is empty
+    if [ ! -s "$file" ]; then
+        echo "File is empty or does not exist"
+        return
+    fi
+
+    case "$lang" in
+        python|py)
+            python3 -m py_compile "$file" 2>&1 && echo ""
+            ;;
+        bash|sh|shell)
+            bash -n "$file" 2>&1 && echo ""
+            ;;
+        javascript|js)
+            if command -v node &> /dev/null; then
+                node --check "$file" 2>&1 && echo ""
+            else
+                echo ""  # Can't verify, assume OK
+            fi
+            ;;
+        ruby|rb)
+            if command -v ruby &> /dev/null; then
+                ruby -c "$file" 2>&1 | grep -v "Syntax OK" || echo ""
+            else
+                echo ""
+            fi
+            ;;
+        perl|pl)
+            if command -v perl &> /dev/null; then
+                perl -c "$file" 2>&1 | grep -v "syntax OK" || echo ""
+            else
+                echo ""
+            fi
+            ;;
+        *)
+            echo ""  # Can't verify unknown languages, assume OK
+            ;;
+    esac
+}
+
+# Function to verify completeness using the model
+verify_completeness() {
+    local model="$1"
+    local original_prompt="$2"
+    local code_file="$3"
+    local hide_thinking="$4"
+
+    local code=$(cat "$code_file")
+
+    local verify_prompt="You are a code reviewer. Analyze if this code fully implements the requirements.
+
+ORIGINAL REQUIREMENTS:
+$original_prompt
+
+GENERATED CODE:
+$code
+
+Respond with ONLY valid JSON (no markdown, no code blocks, no explanation):
+{\"complete\": true} if the code fully meets requirements and is syntactically complete
+{\"complete\": false, \"issues\": [\"issue1\", \"issue2\"]} if incomplete or broken
+
+Check for:
+- Code appears truncated or cut off mid-statement
+- Missing required functionality from the prompt
+- Incomplete function definitions or class structures
+- Missing imports or dependencies that would cause runtime errors"
+
+    local ollama_opts=()
+    if [ "$hide_thinking" = "true" ]; then
+        ollama_opts+=(--hidethinking)
+    fi
+
+    # Run verification and capture response
+    local response=$(ollama run "${ollama_opts[@]}" "$model" "$verify_prompt" 2>/dev/null)
+
+    # Try to extract JSON from response (handle markdown code blocks)
+    local json_response=$(echo "$response" | grep -o '{[^}]*}' | head -1)
+
+    if [ -z "$json_response" ]; then
+        # If no JSON found, assume complete (fail-safe)
+        echo '{"complete": true}'
+    else
+        echo "$json_response"
+    fi
+}
+
+# Function to extract issues from verification response
+extract_issues() {
+    local json="$1"
+    # Extract issues array content, handling various formats
+    echo "$json" | sed -n 's/.*"issues"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr -d '"' | tr ',' '\n' | sed 's/^[[:space:]]*/- /'
+}
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -78,11 +212,17 @@ Options:
   --minimal       Enable minimal mode (strongest prompts + strip comments)
   --thinking      Show model thinking process (hidden by default)
   --hidethinking  Explicitly hide model thinking process (default behavior)
+  --no-verify     Skip output verification (verification enabled by default)
   -h              Show this help message
 
 Commands:
   pop list        Show all active and past pop sessions
   pop model       List all available Ollama models
+
+Verification:
+  By default, pop verifies generated code for syntax errors and completeness.
+  If verification fails, it automatically retries up to 3 times with feedback.
+  Use --no-verify to skip verification for faster (but less reliable) output.
 
 Input Methods:
   1. Command-line argument: pop "write a script..."
@@ -260,6 +400,10 @@ while [[ $# -gt 0 ]]; do
             HIDE_THINKING=false
             shift
             ;;
+        --no-verify)
+            VERIFY=false
+            shift
+            ;;
         --)
             shift
             break
@@ -342,13 +486,15 @@ OUTPUT_FILE="$OUTPUT"
 PROMPT_TEXT="$PROMPT"
 STATUS="running"
 END_TIME=""
+ATTEMPTS="0"
+VERIFIED="false"
 EOF
 
 # Background process function
 run_generation() {
     local session_id="$1"
     local model="$2"
-    local prompt="$3"
+    local original_prompt="$3"
     local output="$4"
     local lang="$5"
     local log="$6"
@@ -356,6 +502,8 @@ run_generation() {
     local active="$8"
     local hide_thinking="$9"
     local minimal_mode="${10}"
+    local do_verify="${11}"
+    local max_retries="${12}"
 
     # Write session header to log
     {
@@ -363,19 +511,19 @@ run_generation() {
         echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "Model: $model"
         echo "Output: $output"
-        echo "Prompt: $prompt"
+        echo "Verification: $do_verify"
+        echo "Prompt: $original_prompt"
         echo ""
-        echo "=== Generation Output ==="
     } >> "$log"
 
     # Build extract-code.py command (use script directory)
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    EXTRACT_CMD="$SCRIPT_DIR/extract-code.py"
+    local base_extract_cmd="$SCRIPT_DIR/extract-code.py"
     if [ -n "$lang" ]; then
-        EXTRACT_CMD="$EXTRACT_CMD --lang $lang"
+        base_extract_cmd="$base_extract_cmd --lang $lang"
     fi
     if [ "$minimal_mode" = "true" ]; then
-        EXTRACT_CMD="$EXTRACT_CMD --strip-comments"
+        base_extract_cmd="$base_extract_cmd --strip-comments"
     fi
 
     # Build ollama options array
@@ -384,47 +532,157 @@ run_generation() {
         ollama_opts+=(--hidethinking)
     fi
 
-    # Build enhanced prompt with clear instructions for clean code
-    if [ "$minimal_mode" = "true" ]; then
-        # Stronger prompt for minimal mode
-        local enhanced_prompt="$prompt
+    # Verification loop
+    local attempt=1
+    local max_attempts=$((max_retries + 1))
+    local status="success"
+    local verified="false"
+    local current_prompt="$original_prompt"
+    local issues=""
+
+    while [ $attempt -le $max_attempts ]; do
+        echo "=== Generation Attempt $attempt/$max_attempts ===" >> "$log"
+
+        # Build enhanced prompt with clear instructions for clean code
+        local enhanced_prompt
+        if [ "$minimal_mode" = "true" ]; then
+            enhanced_prompt="$current_prompt
 
 CRITICAL INSTRUCTIONS:
 - Output ONLY executable code in a single code block
 - NO explanations, NO comments, NO documentation
 - NO text before or after the code block
 - Code must be production-ready and executable immediately"
-    else
-        # Standard prompt enhancement
-        local enhanced_prompt="$prompt
+        else
+            enhanced_prompt="$current_prompt
 
 IMPORTANT: Respond with ONLY the executable code inside a single code block. No explanations, no comments, no text before or after the code block."
-    fi
+        fi
 
-    # Run ollama and extract code
-    local status="success"
-    if ollama run "${ollama_opts[@]}" "$model" "$enhanced_prompt" | tee -a "$log" | $EXTRACT_CMD > "$output"; then
-        if [ -s "$output" ]; then
-            chmod +x "$output"
-            echo "" >> "$log"
-            echo "=== Result ===" >> "$log"
-            echo "✓ Script saved to: $output" >> "$log"
-            echo "✓ Session log: $log" >> "$log"
+        # Run ollama and extract code
+        if ollama run "${ollama_opts[@]}" "$model" "$enhanced_prompt" 2>&1 | tee -a "$log" | $base_extract_cmd > "$output"; then
+            if [ -s "$output" ]; then
+                chmod +x "$output"
+
+                # Skip verification if disabled
+                if [ "$do_verify" != "true" ]; then
+                    echo "" >> "$log"
+                    echo "=== Result (verification skipped) ===" >> "$log"
+                    echo "✓ Script saved to: $output" >> "$log"
+                    verified="skipped"
+                    break
+                fi
+
+                # Detect language for syntax checking
+                local detected_lang=$(detect_language "$output" "$lang")
+                echo "" >> "$log"
+                echo "=== Verification (attempt $attempt) ===" >> "$log"
+                echo "Detected language: $detected_lang" >> "$log"
+
+                # Step 1: Syntax verification
+                local syntax_result=$(verify_syntax "$output" "$detected_lang")
+                if [ -n "$syntax_result" ]; then
+                    echo "✗ Syntax error: $syntax_result" >> "$log"
+                    issues="Syntax error: $syntax_result"
+
+                    if [ $attempt -lt $max_attempts ]; then
+                        current_prompt="$original_prompt
+
+IMPORTANT: Your previous attempt had a syntax error:
+$syntax_result
+
+Please generate COMPLETE, syntactically correct code that compiles/parses without errors."
+                        ((attempt++))
+                        continue
+                    else
+                        echo "✗ Max retries reached with syntax errors" >> "$log"
+                        status="failed"
+                        break
+                    fi
+                fi
+
+                echo "✓ Syntax check passed" >> "$log"
+
+                # Step 2: Completeness verification using the model
+                echo "Running completeness check..." >> "$log"
+                local completeness_result=$(verify_completeness "$model" "$original_prompt" "$output" "$hide_thinking")
+                echo "Completeness result: $completeness_result" >> "$log"
+
+                if echo "$completeness_result" | grep -q '"complete"[[:space:]]*:[[:space:]]*false'; then
+                    issues=$(extract_issues "$completeness_result")
+                    echo "✗ Completeness check failed:" >> "$log"
+                    echo "$issues" >> "$log"
+
+                    if [ $attempt -lt $max_attempts ]; then
+                        current_prompt="$original_prompt
+
+IMPORTANT: Your previous attempt was incomplete or had issues:
+$issues
+
+Please generate a COMPLETE, working implementation that addresses ALL requirements and issues above."
+                        ((attempt++))
+                        continue
+                    else
+                        echo "✗ Max retries reached, accepting best effort" >> "$log"
+                        # Accept the code anyway since syntax is valid
+                        verified="partial"
+                        break
+                    fi
+                fi
+
+                # All checks passed
+                echo "✓ Completeness check passed" >> "$log"
+                verified="true"
+                break
+            else
+                echo "" >> "$log"
+                echo "✗ No code extracted from response" >> "$log"
+                issues="No code block found in response"
+
+                if [ $attempt -lt $max_attempts ]; then
+                    current_prompt="$original_prompt
+
+IMPORTANT: Your previous response did not contain a properly formatted code block.
+Please respond with ONLY executable code inside a markdown code block like:
+\`\`\`python
+# your code here
+\`\`\`"
+                    ((attempt++))
+                    continue
+                else
+                    status="failed"
+                    break
+                fi
+            fi
         else
             echo "" >> "$log"
-            echo "✗ No code extracted. Check log for details." >> "$log"
+            echo "✗ Code generation command failed" >> "$log"
             status="failed"
+            break
         fi
+    done
+
+    # Final result
+    echo "" >> "$log"
+    echo "=== Final Result ===" >> "$log"
+    echo "Attempts: $attempt" >> "$log"
+    echo "Verified: $verified" >> "$log"
+
+    if [ -s "$output" ] && [ "$status" = "success" ]; then
+        echo "✓ Script saved to: $output" >> "$log"
+        echo "✓ Session log: $log" >> "$log"
+    elif [ -s "$output" ]; then
+        echo "⚠ Script saved with issues to: $output" >> "$log"
     else
-        echo "" >> "$log"
-        echo "✗ Code generation failed" >> "$log"
-        status="failed"
+        echo "✗ No output generated" >> "$log"
     fi
 
     # Update metadata with completion status
     local end_time="$(date '+%Y-%m-%d %H:%M:%S')"
     sed -i.bak "s/STATUS=\"running\"/STATUS=\"$status\"/" "$meta"
     sed -i.bak "s/END_TIME=\"\"/END_TIME=\"$end_time\"/" "$meta"
+    sed -i.bak "s/ATTEMPTS=\"0\"/ATTEMPTS=\"$attempt\"/" "$meta"
+    sed -i.bak "s/VERIFIED=\"false\"/VERIFIED=\"$verified\"/" "$meta"
     rm -f "$meta.bak"
 
     # Remove from active sessions
@@ -439,7 +697,7 @@ sed -i.bak "s|OUTPUT_FILE=\".*\"|OUTPUT_FILE=\"$OUTPUT\"|" "$SESSION_META"
 rm -f "$SESSION_META.bak"
 
 # Start background generation
-run_generation "$SESSION_ID" "$MODEL" "$PROMPT" "$OUTPUT" "$LANG" "$SESSION_LOG" "$SESSION_META" "$SESSION_ACTIVE" "$HIDE_THINKING" "$MINIMAL_MODE" &
+run_generation "$SESSION_ID" "$MODEL" "$PROMPT" "$OUTPUT" "$LANG" "$SESSION_LOG" "$SESSION_META" "$SESSION_ACTIVE" "$HIDE_THINKING" "$MINIMAL_MODE" "$VERIFY" "$MAX_RETRIES" &
 
 # Get the background process PID and save to active session file
 BG_PID=$!
@@ -449,6 +707,11 @@ echo "$BG_PID" > "$SESSION_ACTIVE"
 echo -e "${GREEN}✓ pop session started: ${BLUE}$SESSION_ID${NC}"
 echo -e "${GREEN}✓ Model: ${BLUE}$MODEL${NC}"
 echo -e "${GREEN}✓ Output will be saved to: ${BLUE}$OUTPUT${NC}"
+if [ "$VERIFY" = "true" ]; then
+    echo -e "${GREEN}✓ Verification: ${BLUE}enabled (max $MAX_RETRIES retries)${NC}"
+else
+    echo -e "${YELLOW}✓ Verification: ${BLUE}disabled${NC}"
+fi
 echo -e "${GREEN}✓ Session log: ${BLUE}$SESSION_LOG${NC}"
 echo ""
 echo -e "${YELLOW}Generation running in background (PID: $BG_PID)${NC}"

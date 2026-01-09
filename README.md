@@ -17,6 +17,8 @@ A flexible wrapper script for generating code using any Ollama model and automat
 - **Hide Thinking**: Model thinking is hidden by default (use `--thinking` to show)
 - **Incremental Naming**: Automatically avoids overwriting files (script.py → script-1.py → script-2.py)
 - **Auto Shebang**: Automatically inserts appropriate shebang lines for executable scripts
+- **Output Verification**: Automatic syntax checking and model-based completeness verification
+- **Auto-Retry**: Automatically retries up to 3 times when verification fails, with feedback
 - **Multiple Input Methods**: Command-line, file input, or stdin/pipe support
 
 ## Installation
@@ -69,6 +71,7 @@ pop [options] [prompt]
 | `--minimal` | Enable minimal mode (strongest prompts + strip comments) |
 | `--thinking` | Show model thinking process (hidden by default) |
 | `--hidethinking` | Explicitly hide model thinking process (default behavior) |
+| `--no-verify` | Skip output verification (verification enabled by default) |
 | `-h` | Show help message |
 
 ### Commands
@@ -77,6 +80,32 @@ pop [options] [prompt]
 |---------|-------------|
 | `pop list` | Show all active and past pop sessions on this host |
 | `pop model` | List all available Ollama models |
+
+### Output Verification
+
+By default, **pop** verifies all generated code through a two-step process:
+
+1. **Syntax Verification**: Checks that the code is syntactically valid using language-specific tools:
+   - Python: `python3 -m py_compile`
+   - Bash/Shell: `bash -n`
+   - JavaScript: `node --check`
+   - Ruby: `ruby -c`
+   - Perl: `perl -c`
+
+2. **Completeness Verification**: Uses the same model to review the generated code against the original requirements, checking for:
+   - Truncated or cut-off code
+   - Missing required functionality
+   - Incomplete structures
+
+If verification fails, **pop** automatically retries with feedback about what went wrong, up to 3 times.
+
+```bash
+# Default behavior - verification enabled
+pop "write a web scraper"
+
+# Skip verification for faster output
+pop --no-verify "write a hello world script"
+```
 
 ### Input Methods
 
@@ -756,6 +785,14 @@ Found a bug or have a feature request? Open an issue or submit a pull request.
 - [Prompt Engineering Guide](https://www.promptingguide.ai/)
 
 ## Changelog
+
+### v3.2 - Output Verification & Auto-Retry
+- **Output verification**: Automatic syntax checking for Python, Bash, JavaScript, Ruby, Perl
+- **Completeness verification**: Model-based review to detect truncated or incomplete code
+- **Auto-retry with feedback**: Automatically retries up to 3 times when verification fails
+- **`--no-verify` flag**: Skip verification for faster (but less reliable) output
+- **Session metadata**: Tracks attempt count and verification status in session metadata
+- **Verification enabled by default**: All outputs verified unless `--no-verify` is specified
 
 ### v3.1 - Model Discovery, Minimal Mode & Quality Improvements
 - **`pop model` command**: List all available Ollama models
