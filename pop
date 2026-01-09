@@ -223,6 +223,181 @@ def extract_issues(json_str: str) -> str:
         return ""
 
 
+def detect_missing_modules(filepath: str, lang: str) -> Tuple[list, str]:
+    """
+    Try to run/parse the script and detect missing modules.
+    Returns (list of missing modules, full error output).
+    """
+    missing_modules = []
+    error_output = ""
+
+    if lang not in ('python', 'py'):
+        return missing_modules, error_output
+
+    # Try running with python to catch import errors
+    try:
+        result = subprocess.run(
+            ['python3', '-c', f'import ast; ast.parse(open("{filepath}").read())'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            error_output = result.stderr
+    except:
+        pass
+
+    # Try to actually import/run to catch ModuleNotFoundError
+    try:
+        result = subprocess.run(
+            ['python3', filepath],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
+        )
+        error_output = result.stderr
+
+        # Parse for ModuleNotFoundError or ImportError
+        for line in error_output.split('\n'):
+            if 'ModuleNotFoundError' in line or 'ImportError' in line:
+                # Extract module name
+                match = re.search(r"No module named ['\"]([^'\"]+)['\"]", line)
+                if match:
+                    module = match.group(1).split('.')[0]  # Get base module
+                    if module not in missing_modules:
+                        missing_modules.append(module)
+    except subprocess.TimeoutExpired:
+        error_output = "Script execution timed out"
+    except Exception as e:
+        error_output = str(e)
+
+    return missing_modules, error_output
+
+
+def analyze_script_issues(model: str, code: str, user_instructions: str,
+                          runtime_errors: str, hide_thinking: bool) -> dict:
+    """
+    Ask the model to analyze the script and identify issues.
+    Returns dict with 'issues', 'missing_modules', and 'fixes'.
+    """
+    analyze_prompt = f'''Analyze this script for issues and problems.
+
+SCRIPT:
+```
+{code}
+```
+
+USER'S FIX REQUEST:
+{user_instructions}
+
+RUNTIME ERRORS (if any):
+{runtime_errors if runtime_errors else "No runtime errors detected"}
+
+Respond with ONLY valid JSON (no markdown, no explanation):
+{{
+    "issues": ["issue 1 description", "issue 2 description"],
+    "missing_modules": ["module1", "module2"],
+    "fixes_to_apply": ["fix 1 description", "fix 2 description"]
+}}
+
+Identify:
+- Syntax errors or typos
+- Missing imports or modules that need to be installed via pip
+- Logic errors
+- Issues mentioned in the user's fix request
+- Any other problems that would prevent the script from running'''
+
+    cmd = ['ollama', 'run']
+    if hide_thinking:
+        cmd.append('--hidethinking')
+    cmd.extend([model, analyze_prompt])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        response = result.stdout
+
+        # Try to extract JSON from response
+        match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except:
+                pass
+    except:
+        pass
+
+    return {"issues": [], "missing_modules": [], "fixes_to_apply": []}
+
+
+def generate_requirements_file(modules: list, output_dir: str, script_name: str) -> Optional[str]:
+    """
+    Generate a requirements.txt file for missing modules.
+    Returns the path to the requirements file, or None if no modules.
+    """
+    if not modules:
+        return None
+
+    # Map common module names to pip package names
+    pip_name_map = {
+        'cv2': 'opencv-python',
+        'PIL': 'Pillow',
+        'sklearn': 'scikit-learn',
+        'yaml': 'PyYAML',
+        'bs4': 'beautifulsoup4',
+        'dotenv': 'python-dotenv',
+    }
+
+    pip_packages = []
+    for mod in modules:
+        pip_name = pip_name_map.get(mod, mod)
+        if pip_name not in pip_packages:
+            pip_packages.append(pip_name)
+
+    req_file = Path(output_dir) / f"{Path(script_name).stem}_requirements.txt"
+    with open(req_file, 'w') as f:
+        f.write(f"# Requirements for {script_name}\n")
+        f.write(f"# Install with: pip install -r {req_file.name}\n")
+        f.write("#\n")
+        for pkg in pip_packages:
+            f.write(f"{pkg}\n")
+
+    return str(req_file)
+
+
+def add_installation_header(code: str, requirements_file: str, missing_modules: list,
+                            lang: str) -> str:
+    """Add installation instructions as comments at the top of the script."""
+    if not missing_modules or lang not in ('python', 'py'):
+        return code
+
+    lines = code.split('\n')
+    shebang = ""
+    code_start = 0
+
+    # Preserve shebang if present
+    if lines and lines[0].startswith('#!'):
+        shebang = lines[0] + '\n'
+        code_start = 1
+
+    req_basename = Path(requirements_file).name
+    modules_list = ', '.join(missing_modules)
+
+    header = f'''{shebang}# ============================================================
+# DEPENDENCIES REQUIRED
+# ============================================================
+# This script requires the following modules: {modules_list}
+#
+# Install dependencies with ONE of these methods:
+#
+#   Option 1 - Using requirements file:
+#     pip install -r {req_basename}
+#
+#   Option 2 - Install directly:
+#     pip install {' '.join(missing_modules)}
+#
+# ============================================================
+
+'''
+    return header + '\n'.join(lines[code_start:])
+
+
 def ensure_shebang(code: str, language: Optional[str] = None) -> str:
     """Ensure code has a valid shebang line at the beginning."""
     lines = code.split('\n')
@@ -658,7 +833,7 @@ Please respond with ONLY executable code inside a markdown code block like:
 def run_fix(session_id: str, model: str, fix_prompt: str, source_file: str, output: str,
             lang: Optional[str], log_file: str, meta_file: str, active_file: str,
             hide_thinking: bool, minimal_mode: bool, do_verify: bool, max_retries: int):
-    """Run the code fix process with verification loop."""
+    """Run the code fix process with verification loop and dependency detection."""
 
     # Read the source file
     try:
@@ -668,6 +843,9 @@ def run_fix(session_id: str, model: str, fix_prompt: str, source_file: str, outp
         with open(log_file, 'a') as log:
             log.write(f"✗ Failed to read source file: {e}\n")
         return
+
+    # Detect language
+    detected_lang = lang or detect_language(source_file)
 
     # Write session header to log
     with open(log_file, 'a') as log:
@@ -680,7 +858,61 @@ def run_fix(session_id: str, model: str, fix_prompt: str, source_file: str, outp
         log.write(f"Fix Instructions: {fix_prompt}\n\n")
         log.write(f"=== Original Code ===\n{original_code}\n\n")
 
-    # Build the fix prompt with original code context
+    # Phase 1: Analyze original script for issues
+    with open(log_file, 'a') as log:
+        log.write("=== Analyzing Original Script ===\n")
+
+    # Detect missing modules from runtime
+    runtime_missing, runtime_errors = detect_missing_modules(source_file, detected_lang)
+    with open(log_file, 'a') as log:
+        if runtime_missing:
+            log.write(f"Missing modules detected: {', '.join(runtime_missing)}\n")
+        if runtime_errors:
+            log.write(f"Runtime errors:\n{runtime_errors}\n")
+
+    # Ask model to analyze for issues
+    with open(log_file, 'a') as log:
+        log.write("Running AI analysis...\n")
+
+    analysis = analyze_script_issues(model, original_code, fix_prompt, runtime_errors, hide_thinking)
+
+    issues_found = analysis.get('issues', [])
+    model_missing_modules = analysis.get('missing_modules', [])
+    fixes_to_apply = analysis.get('fixes_to_apply', [])
+
+    # Combine missing modules from runtime detection and model analysis
+    all_missing_modules = list(set(runtime_missing + model_missing_modules))
+
+    with open(log_file, 'a') as log:
+        log.write("\n=== Issues Found ===\n")
+        if issues_found:
+            for i, issue in enumerate(issues_found, 1):
+                log.write(f"  {i}. {issue}\n")
+        else:
+            log.write("  No specific issues identified\n")
+
+        if all_missing_modules:
+            log.write(f"\n=== Missing Dependencies ===\n")
+            for mod in all_missing_modules:
+                log.write(f"  - {mod}\n")
+
+        if fixes_to_apply:
+            log.write(f"\n=== Fixes to Apply ===\n")
+            for i, fix in enumerate(fixes_to_apply, 1):
+                log.write(f"  {i}. {fix}\n")
+        log.write("\n")
+
+    # Build the fix prompt with analysis context
+    issues_context = ""
+    if issues_found or all_missing_modules or fixes_to_apply:
+        issues_context = "\n\nANALYSIS OF ISSUES FOUND:\n"
+        if issues_found:
+            issues_context += "Issues:\n" + "\n".join(f"- {i}" for i in issues_found) + "\n"
+        if all_missing_modules:
+            issues_context += f"Missing modules that need imports: {', '.join(all_missing_modules)}\n"
+        if fixes_to_apply:
+            issues_context += "Fixes needed:\n" + "\n".join(f"- {f}" for f in fixes_to_apply) + "\n"
+
     base_fix_prompt = f"""Here is an existing script that needs to be fixed/modified:
 
 ```
@@ -688,7 +920,7 @@ def run_fix(session_id: str, model: str, fix_prompt: str, source_file: str, outp
 ```
 
 TASK: {fix_prompt}
-
+{issues_context}
 Respond with the COMPLETE fixed/modified script. Output ONLY the executable code inside a single code block. Include ALL the original code with your fixes applied - do not omit any parts."""
 
     # Verification loop
@@ -697,6 +929,7 @@ Respond with the COMPLETE fixed/modified script. Output ONLY the executable code
     status = "success"
     verified = "false"
     current_prompt = base_fix_prompt
+    requirements_file = None
 
     while attempt <= max_attempts:
         with open(log_file, 'a') as log:
@@ -842,19 +1075,64 @@ Please respond with the COMPLETE fixed script inside a markdown code block."""
             status = "failed"
             break
 
+    # Post-fix: Check for dependencies and generate requirements
+    if Path(output).exists() and Path(output).stat().st_size > 0:
+        final_lang = detect_language(output, lang)
+        fixed_missing, fixed_errors = detect_missing_modules(output, final_lang)
+
+        # Combine with originally detected missing modules
+        final_missing = list(set(all_missing_modules + fixed_missing))
+
+        if final_missing:
+            with open(log_file, 'a') as log:
+                log.write(f"\n=== Dependencies Required ===\n")
+                log.write(f"The following modules need to be installed:\n")
+                for mod in final_missing:
+                    log.write(f"  - {mod}\n")
+
+            # Generate requirements file
+            output_dir = str(Path(output).parent) if Path(output).parent != Path('.') else '.'
+            requirements_file = generate_requirements_file(final_missing, output_dir, output)
+
+            if requirements_file:
+                with open(log_file, 'a') as log:
+                    log.write(f"\n✓ Requirements file created: {requirements_file}\n")
+                    log.write(f"  Install with: pip install -r {Path(requirements_file).name}\n")
+
+                # Add installation header to the fixed script
+                with open(output, 'r') as f:
+                    fixed_code = f.read()
+                fixed_code = add_installation_header(fixed_code, requirements_file, final_missing, final_lang)
+                with open(output, 'w') as f:
+                    f.write(fixed_code)
+
     # Final result
     with open(log_file, 'a') as log:
         log.write(f"\n=== Final Result ===\n")
         log.write(f"Attempts: {attempt}\n")
         log.write(f"Verified: {verified}\n")
 
+        # Log issues that were found and fixed
+        if issues_found or fixes_to_apply:
+            log.write(f"\n=== Issues Addressed ===\n")
+            if issues_found:
+                log.write("Issues found:\n")
+                for issue in issues_found:
+                    log.write(f"  ✓ {issue}\n")
+            if fixes_to_apply:
+                log.write("Fixes applied:\n")
+                for fix in fixes_to_apply:
+                    log.write(f"  ✓ {fix}\n")
+
         if Path(output).exists() and Path(output).stat().st_size > 0 and status == "success":
-            log.write(f"✓ Fixed script saved to: {output}\n")
+            log.write(f"\n✓ Fixed script saved to: {output}\n")
+            if requirements_file:
+                log.write(f"✓ Requirements file: {requirements_file}\n")
             log.write(f"✓ Session log: {log_file}\n")
         elif Path(output).exists() and Path(output).stat().st_size > 0:
-            log.write(f"⚠ Fixed script saved with issues to: {output}\n")
+            log.write(f"\n⚠ Fixed script saved with issues to: {output}\n")
         else:
-            log.write("✗ No output generated\n")
+            log.write("\n✗ No output generated\n")
 
     # Update metadata
     end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

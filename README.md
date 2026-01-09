@@ -20,6 +20,7 @@ A flexible wrapper script for generating code using any Ollama model and automat
 - **Output Verification**: Automatic syntax checking and model-based completeness verification
 - **Auto-Retry**: Automatically retries up to 3 times when verification fails, with feedback
 - **Fix Mode**: Fix existing scripts with `-fix:<script>` parameter
+- **Dependency Detection**: Automatically detects missing modules and generates requirements.txt
 - **Multiple Input Methods**: Command-line, file input, or stdin/pipe support
 - **Pure Python**: Written entirely in Python for portability
 
@@ -134,13 +135,87 @@ pop --minimal -fix:./verbose.py "simplify this script"
 
 **How it works:**
 1. Reads the source file
-2. Sends the code + your instructions to the model
-3. Extracts the fixed code from the response
-4. Verifies syntax and completeness (same as generation mode)
-5. Retries up to 3 times if verification fails
-6. Saves output as `<original>_popfix`
+2. **Analyzes for issues**: Runs the script to detect runtime errors and missing modules
+3. **AI Analysis**: Asks the model to identify issues, missing dependencies, and fixes needed
+4. Sends the code + analysis + your instructions to the model
+5. Extracts the fixed code from the response
+6. Verifies syntax and completeness (same as generation mode)
+7. Retries up to 3 times if verification fails
+8. **Generates requirements.txt** if missing dependencies are detected
+9. **Adds installation instructions** as comments in the fixed script
+10. **Logs all issues found and fixed** in the session log
+11. Saves output as `<original>_popfix`
 
 The original file is **never modified** - the fixed version is always saved with the `_popfix` suffix.
+
+### Dependency Detection
+
+When fixing Python scripts, pop automatically:
+
+1. **Detects missing modules** by attempting to run the script
+2. **Analyzes imports** with AI to identify required packages
+3. **Creates a requirements file** (e.g., `myscript_requirements.txt`)
+4. **Adds installation instructions** to the fixed script header
+
+```bash
+# Fix a script that uses requests and pandas (not installed)
+pop -fix:./data_fetcher.py "fix syntax errors"
+
+# Creates:
+# - data_fetcher.py_popfix (with installation instructions header)
+# - data_fetcher_requirements.txt
+```
+
+**Example fixed script header:**
+```python
+#!/usr/bin/env python3
+# ============================================================
+# DEPENDENCIES REQUIRED
+# ============================================================
+# This script requires the following modules: requests, pandas
+#
+# Install dependencies with ONE of these methods:
+#
+#   Option 1 - Using requirements file:
+#     pip install -r data_fetcher_requirements.txt
+#
+#   Option 2 - Install directly:
+#     pip install requests pandas
+#
+# ============================================================
+
+import requests
+import pandas as pd
+# ... rest of script
+```
+
+### Issue Logging
+
+Fix mode logs all discovered issues and applied fixes to the session log:
+
+```
+=== Issues Found ===
+  1. Unterminated string literal in line 6
+  2. Missing closing parenthesis in line 8
+  3. Function name typo: fetch_dat vs fetch_data
+
+=== Missing Dependencies ===
+  - pandas
+  - requests
+
+=== Fixes to Apply ===
+  1. Add closing quote to the URL string
+  2. Correct function name to fetch_data
+  3. Fix method call from .haed() to .head()
+
+=== Issues Addressed ===
+Issues found:
+  ✓ Unterminated string literal in line 6
+  ✓ Missing closing parenthesis in line 8
+Fixes applied:
+  ✓ Add closing quote to the URL string
+  ✓ Correct function name to fetch_data
+```
 
 ### Input Methods
 
@@ -820,6 +895,15 @@ Found a bug or have a feature request? Open an issue or submit a pull request.
 - [Prompt Engineering Guide](https://www.promptingguide.ai/)
 
 ## Changelog
+
+### v4.1 - Enhanced Fix Mode with Dependency Detection
+- **Dependency detection**: Automatically detects missing Python modules by running the script
+- **AI-powered issue analysis**: Uses the model to analyze scripts and identify all issues
+- **Requirements file generation**: Creates `<script>_requirements.txt` for missing dependencies
+- **Installation instructions**: Adds clear installation instructions as comments in fixed scripts
+- **Issue logging**: Logs all issues found, missing dependencies, and fixes applied
+- **Common package mapping**: Maps module names to pip packages (e.g., `cv2` → `opencv-python`, `PIL` → `Pillow`)
+- **Enhanced fix prompts**: Includes detected issues in the fix prompt for better AI context
 
 ### v4.0 - Python Rewrite & Fix Mode
 - **Complete Python rewrite**: pop is now written entirely in Python (was bash)
