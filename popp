@@ -1,9 +1,798 @@
-#!/bin/bash
-# popp - Pop with minimal mode enabled by default
-# This is a convenience wrapper that calls pop with --minimal flag
+#!/usr/bin/env python3
+"""
+popp - Prompt-Oriented Programming (Python version)
+LLM Code Generator using Ollama models
 
-# Get the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+Usage: popp [options] [prompt]
+"""
 
-# Call pop with --minimal flag, passing through all arguments
-exec "$SCRIPT_DIR/pop" --minimal "$@"
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from multiprocessing import Process
+from pathlib import Path
+from typing import Optional, Tuple
+
+# Colors for terminal output
+class Colors:
+    RED = '\033[0;31m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[0;34m'
+    CYAN = '\033[0;36m'
+    NC = '\033[0m'  # No Color
+
+
+# Default configuration
+DEFAULT_MODEL = "qwen3:latest"
+DEFAULT_OUTPUT = "script.py"
+MAX_RETRIES = 3
+POP_DIR = Path.home() / ".pop"
+SESSIONS_DIR = POP_DIR / "sessions"
+ACTIVE_DIR = POP_DIR / "active"
+
+
+def ensure_directories():
+    """Create pop directories if they don't exist."""
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_output_filename(base_output: str) -> str:
+    """Get incremental output filename to avoid overwriting existing files."""
+    output = Path(base_output)
+
+    if not output.exists():
+        return str(output)
+
+    # Extract components
+    parent = output.parent
+    stem = output.stem
+    suffix = output.suffix
+
+    counter = 1
+    while True:
+        if suffix:
+            new_output = parent / f"{stem}-{counter}{suffix}"
+        else:
+            new_output = parent / f"{output.name}-{counter}"
+
+        if not new_output.exists():
+            return str(new_output)
+        counter += 1
+
+
+def detect_language(filepath: str, specified_lang: Optional[str] = None) -> str:
+    """Detect programming language from file."""
+    if specified_lang:
+        return specified_lang
+
+    path = Path(filepath)
+
+    # Check shebang first
+    if path.exists():
+        try:
+            with open(path, 'r') as f:
+                first_line = f.readline()
+                if 'python' in first_line:
+                    return 'python'
+                if 'bash' in first_line or '/bin/sh' in first_line:
+                    return 'bash'
+                if 'node' in first_line:
+                    return 'javascript'
+                if 'ruby' in first_line:
+                    return 'ruby'
+                if 'perl' in first_line:
+                    return 'perl'
+        except:
+            pass
+
+    # Fall back to extension
+    ext_map = {
+        '.py': 'python',
+        '.sh': 'bash',
+        '.bash': 'bash',
+        '.js': 'javascript',
+        '.rb': 'ruby',
+        '.pl': 'perl',
+        '.php': 'php',
+    }
+    return ext_map.get(path.suffix, 'unknown')
+
+
+def verify_syntax(filepath: str, lang: str) -> str:
+    """Verify syntax of generated code. Returns empty string on success, error message on failure."""
+    path = Path(filepath)
+
+    if not path.exists() or path.stat().st_size == 0:
+        return "File is empty or does not exist"
+
+    try:
+        if lang in ('python', 'py'):
+            result = subprocess.run(
+                ['python3', '-m', 'py_compile', filepath],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return result.stderr.strip()
+            return ""
+
+        elif lang in ('bash', 'sh', 'shell'):
+            result = subprocess.run(
+                ['bash', '-n', filepath],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return result.stderr.strip()
+            return ""
+
+        elif lang in ('javascript', 'js'):
+            if subprocess.run(['which', 'node'], capture_output=True).returncode == 0:
+                result = subprocess.run(
+                    ['node', '--check', filepath],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    return result.stderr.strip()
+            return ""
+
+        elif lang in ('ruby', 'rb'):
+            if subprocess.run(['which', 'ruby'], capture_output=True).returncode == 0:
+                result = subprocess.run(
+                    ['ruby', '-c', filepath],
+                    capture_output=True, text=True
+                )
+                if 'Syntax OK' not in result.stdout and result.returncode != 0:
+                    return result.stderr.strip()
+            return ""
+
+        elif lang in ('perl', 'pl'):
+            if subprocess.run(['which', 'perl'], capture_output=True).returncode == 0:
+                result = subprocess.run(
+                    ['perl', '-c', filepath],
+                    capture_output=True, text=True
+                )
+                if 'syntax OK' not in result.stderr and result.returncode != 0:
+                    return result.stderr.strip()
+            return ""
+
+        else:
+            return ""  # Can't verify unknown languages, assume OK
+
+    except Exception as e:
+        return str(e)
+
+
+def verify_completeness(model: str, original_prompt: str, code_file: str, hide_thinking: bool) -> str:
+    """Verify completeness using the model. Returns JSON response."""
+    try:
+        with open(code_file, 'r') as f:
+            code = f.read()
+    except:
+        return '{"complete": true}'
+
+    verify_prompt = f'''You are a code reviewer. Analyze if this code fully implements the requirements.
+
+ORIGINAL REQUIREMENTS:
+{original_prompt}
+
+GENERATED CODE:
+{code}
+
+Respond with ONLY valid JSON (no markdown, no code blocks, no explanation):
+{{"complete": true}} if the code fully meets requirements and is syntactically complete
+{{"complete": false, "issues": ["issue1", "issue2"]}} if incomplete or broken
+
+Check for:
+- Code appears truncated or cut off mid-statement
+- Missing required functionality from the prompt
+- Incomplete function definitions or class structures
+- Missing imports or dependencies that would cause runtime errors'''
+
+    cmd = ['ollama', 'run']
+    if hide_thinking:
+        cmd.append('--hidethinking')
+    cmd.extend([model, verify_prompt])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        response = result.stdout
+
+        # Try to extract JSON from response
+        match = re.search(r'\{[^}]*\}', response)
+        if match:
+            return match.group()
+        return '{"complete": true}'
+    except:
+        return '{"complete": true}'
+
+
+def extract_issues(json_str: str) -> str:
+    """Extract issues from verification response."""
+    try:
+        data = json.loads(json_str)
+        issues = data.get('issues', [])
+        return '\n'.join(f'- {issue}' for issue in issues)
+    except:
+        return ""
+
+
+def ensure_shebang(code: str, language: Optional[str] = None) -> str:
+    """Ensure code has a valid shebang line at the beginning."""
+    lines = code.split('\n')
+
+    if lines and lines[0].strip().startswith('#!'):
+        return code
+
+    # Detect language if not specified
+    if not language:
+        if 'import ' in code or 'def ' in code or 'class ' in code:
+            language = 'python'
+        elif 'function ' in code or 'const ' in code or 'let ' in code:
+            language = 'javascript'
+        elif 'echo ' in code or '[[' in code or 'if [' in code:
+            language = 'bash'
+
+    # Determine appropriate shebang
+    shebang_map = {
+        'python': '#!/usr/bin/env python3',
+        'py': '#!/usr/bin/env python3',
+        'bash': '#!/bin/bash',
+        'sh': '#!/bin/bash',
+        'shell': '#!/bin/bash',
+        'javascript': '#!/usr/bin/env node',
+        'js': '#!/usr/bin/env node',
+        'node': '#!/usr/bin/env node',
+        'ruby': '#!/usr/bin/env ruby',
+        'rb': '#!/usr/bin/env ruby',
+        'perl': '#!/usr/bin/env perl',
+        'pl': '#!/usr/bin/env perl',
+        'php': '#!/usr/bin/env php',
+    }
+
+    shebang = shebang_map.get(language)
+    if shebang:
+        return f"{shebang}\n{code}"
+    return code
+
+
+def strip_comments(code: str, language: Optional[str] = None) -> str:
+    """Remove comments from code while preserving functionality."""
+    if not language:
+        if code.strip().startswith('#!/usr/bin/env python') or 'import ' in code or 'def ' in code:
+            language = 'python'
+        elif code.strip().startswith('#!/bin/bash') or code.strip().startswith('#!/bin/sh'):
+            language = 'bash'
+
+    if language in ('python', 'py'):
+        lines = code.split('\n')
+        cleaned_lines = []
+        for i, line in enumerate(lines):
+            if i == 0 and line.strip().startswith('#!'):
+                cleaned_lines.append(line)
+            elif '#' in line:
+                # Simple approach: remove # comments not in strings
+                in_string = False
+                quote_char = None
+                result = []
+                for j, char in enumerate(line):
+                    if char in ('"', "'") and (j == 0 or line[j-1] != '\\'):
+                        if not in_string:
+                            in_string = True
+                            quote_char = char
+                        elif char == quote_char:
+                            in_string = False
+                    if char == '#' and not in_string:
+                        break
+                    result.append(char)
+                cleaned_lines.append(''.join(result).rstrip())
+            else:
+                cleaned_lines.append(line)
+        code = '\n'.join(cleaned_lines)
+        # Remove docstrings
+        code = re.sub(r'^\s*""".*?"""\s*$', '', code, flags=re.MULTILINE | re.DOTALL)
+        code = re.sub(r"^\s*'''.*?'''\s*$", '', code, flags=re.MULTILINE | re.DOTALL)
+
+    elif language in ('bash', 'sh', 'shell'):
+        lines = code.split('\n')
+        cleaned_lines = []
+        for i, line in enumerate(lines):
+            if i == 0 and line.strip().startswith('#!'):
+                cleaned_lines.append(line)
+            elif '#' in line:
+                idx = line.find('#')
+                cleaned_lines.append(line[:idx].rstrip())
+            else:
+                cleaned_lines.append(line)
+        code = '\n'.join(cleaned_lines)
+
+    elif language in ('javascript', 'js', 'typescript', 'ts'):
+        code = re.sub(r'//.*$', '', code, flags=re.MULTILINE)
+        code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+
+    # Remove excessive blank lines
+    code = re.sub(r'\n\s*\n\s*\n+', '\n\n', code)
+    return code
+
+
+def extract_code_blocks(text: str, language: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """Extract code blocks from markdown-formatted text."""
+    pattern = r'```(\w+)?\n(.*?)```'
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    if not matches:
+        return (text, language)
+
+    if language:
+        matches = [(lang, code) for lang, code in matches if lang and lang.lower() == language.lower()]
+
+    if not matches:
+        return ("", language)
+
+    detected_lang, code = matches[0]
+    return (code.strip(), detected_lang or language)
+
+
+def list_sessions():
+    """List all active and past sessions."""
+    print(f"{Colors.CYAN}=== Past Sessions (Last 20) ==={Colors.NC}")
+
+    past_count = 0
+    if SESSIONS_DIR.exists():
+        meta_files = sorted(SESSIONS_DIR.glob("*.meta"), key=lambda x: x.stat().st_mtime)[-20:]
+
+        for meta_file in meta_files:
+            session_id = meta_file.stem
+            active_file = ACTIVE_DIR / f"{session_id}.session"
+
+            if active_file.exists():
+                continue  # Skip active sessions
+
+            try:
+                meta = {}
+                with open(meta_file) as f:
+                    for line in f:
+                        if '=' in line:
+                            key, val = line.strip().split('=', 1)
+                            meta[key] = val.strip('"')
+
+                status = meta.get('STATUS', '')
+                if status == 'failed':
+                    icon, color = '✗', Colors.RED
+                else:
+                    icon, color = '✓', Colors.GREEN
+
+                print(f"{color}{icon}{Colors.NC} {session_id}")
+                print(f"  Time: {meta.get('START_TIME', '')} → {meta.get('END_TIME', '')}")
+                print(f"  Model: {meta.get('MODEL_NAME', '')}")
+                print(f"  Output: {meta.get('OUTPUT_FILE', '')}")
+                prompt_text = meta.get('PROMPT_TEXT', '')[:60]
+                print(f"  Prompt: {prompt_text}...")
+                print(f"  Log: {SESSIONS_DIR}/{session_id}.log")
+                print()
+                past_count += 1
+            except:
+                pass
+
+    if past_count == 0:
+        print(f"{Colors.YELLOW}No past sessions{Colors.NC}")
+
+    print()
+    print(f"{Colors.CYAN}=== Active Sessions ==={Colors.NC}")
+
+    active_count = 0
+    if ACTIVE_DIR.exists():
+        for session_file in ACTIVE_DIR.glob("*.session"):
+            session_id = session_file.stem
+            try:
+                pid = int(session_file.read_text().strip())
+
+                # Check if process is running
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    session_file.unlink()
+                    continue
+
+                meta_file = SESSIONS_DIR / f"{session_id}.meta"
+                if meta_file.exists():
+                    meta = {}
+                    with open(meta_file) as f:
+                        for line in f:
+                            if '=' in line:
+                                key, val = line.strip().split('=', 1)
+                                meta[key] = val.strip('"')
+
+                    print(f"{Colors.GREEN}● {Colors.NC}{session_id} (PID: {pid})")
+                    print(f"  Started: {meta.get('START_TIME', '')}")
+                    print(f"  Model: {meta.get('MODEL_NAME', '')}")
+                    print(f"  Output: {meta.get('OUTPUT_FILE', '')}")
+                    prompt_text = meta.get('PROMPT_TEXT', '')[:60]
+                    print(f"  Prompt: {prompt_text}...")
+                    print()
+                    active_count += 1
+            except:
+                pass
+
+    if active_count == 0:
+        print(f"{Colors.YELLOW}No active sessions{Colors.NC}")
+
+
+def list_models():
+    """List available Ollama models."""
+    print(f"{Colors.CYAN}=== Available Ollama Models ==={Colors.NC}")
+
+    try:
+        result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
+        if result.returncode != 0 or not result.stdout.strip():
+            print(f"{Colors.RED}✗ No models found or Ollama is not running{Colors.NC}")
+            print(f"{Colors.YELLOW}Install models with: ollama pull <model>{Colors.NC}")
+            sys.exit(1)
+
+        print(result.stdout)
+    except FileNotFoundError:
+        print(f"{Colors.RED}✗ Ollama not found. Please install Ollama first.{Colors.NC}")
+        sys.exit(1)
+
+
+def verify_model_exists(model: str) -> bool:
+    """Check if the specified model exists."""
+    try:
+        result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
+        return model in result.stdout
+    except:
+        return False
+
+
+def run_generation(session_id: str, model: str, original_prompt: str, output: str,
+                   lang: Optional[str], log_file: str, meta_file: str, active_file: str,
+                   hide_thinking: bool, minimal_mode: bool, do_verify: bool, max_retries: int):
+    """Run the code generation process with verification loop."""
+
+    # Write session header to log
+    with open(log_file, 'a') as log:
+        log.write(f"=== popp Session: {session_id} ===\n")
+        log.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Model: {model}\n")
+        log.write(f"Output: {output}\n")
+        log.write(f"Verification: {do_verify}\n")
+        log.write(f"Prompt: {original_prompt}\n\n")
+
+    # Verification loop
+    attempt = 1
+    max_attempts = max_retries + 1
+    status = "success"
+    verified = "false"
+    current_prompt = original_prompt
+
+    while attempt <= max_attempts:
+        with open(log_file, 'a') as log:
+            log.write(f"=== Generation Attempt {attempt}/{max_attempts} ===\n")
+
+        # Build enhanced prompt
+        if minimal_mode:
+            enhanced_prompt = f"""{current_prompt}
+
+CRITICAL INSTRUCTIONS:
+- Output ONLY executable code in a single code block
+- NO explanations, NO comments, NO documentation
+- NO text before or after the code block
+- Code must be production-ready and executable immediately"""
+        else:
+            enhanced_prompt = f"""{current_prompt}
+
+IMPORTANT: Respond with ONLY the executable code inside a single code block. No explanations, no comments, no text before or after the code block."""
+
+        # Run ollama
+        cmd = ['ollama', 'run']
+        if hide_thinking:
+            cmd.append('--hidethinking')
+        cmd.extend([model, enhanced_prompt])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            response = result.stdout
+
+            # Log raw response
+            with open(log_file, 'a') as log:
+                log.write(response + "\n")
+
+            # Extract code
+            code, detected_lang = extract_code_blocks(response, lang)
+
+            if code:
+                # Ensure shebang
+                code = ensure_shebang(code, detected_lang or lang)
+
+                # Strip comments if minimal mode
+                if minimal_mode:
+                    code = strip_comments(code, detected_lang or lang)
+
+                # Write output file
+                with open(output, 'w') as f:
+                    f.write(code)
+                os.chmod(output, 0o755)
+
+                # Skip verification if disabled
+                if not do_verify:
+                    with open(log_file, 'a') as log:
+                        log.write("\n=== Result (verification skipped) ===\n")
+                        log.write(f"✓ Script saved to: {output}\n")
+                    verified = "skipped"
+                    break
+
+                # Detect language for syntax checking
+                detected = detect_language(output, lang)
+                with open(log_file, 'a') as log:
+                    log.write(f"\n=== Verification (attempt {attempt}) ===\n")
+                    log.write(f"Detected language: {detected}\n")
+
+                # Step 1: Syntax verification
+                syntax_result = verify_syntax(output, detected)
+                if syntax_result:
+                    with open(log_file, 'a') as log:
+                        log.write(f"✗ Syntax error: {syntax_result}\n")
+
+                    if attempt < max_attempts:
+                        current_prompt = f"""{original_prompt}
+
+IMPORTANT: Your previous attempt had a syntax error:
+{syntax_result}
+
+Please generate COMPLETE, syntactically correct code that compiles/parses without errors."""
+                        attempt += 1
+                        continue
+                    else:
+                        with open(log_file, 'a') as log:
+                            log.write("✗ Max retries reached with syntax errors\n")
+                        status = "failed"
+                        break
+
+                with open(log_file, 'a') as log:
+                    log.write("✓ Syntax check passed\n")
+
+                # Step 2: Completeness verification
+                with open(log_file, 'a') as log:
+                    log.write("Running completeness check...\n")
+
+                completeness_result = verify_completeness(model, original_prompt, output, hide_thinking)
+
+                with open(log_file, 'a') as log:
+                    log.write(f"Completeness result: {completeness_result}\n")
+
+                if '"complete": false' in completeness_result or '"complete":false' in completeness_result:
+                    issues = extract_issues(completeness_result)
+                    with open(log_file, 'a') as log:
+                        log.write(f"✗ Completeness check failed:\n{issues}\n")
+
+                    if attempt < max_attempts:
+                        current_prompt = f"""{original_prompt}
+
+IMPORTANT: Your previous attempt was incomplete or had issues:
+{issues}
+
+Please generate a COMPLETE, working implementation that addresses ALL requirements and issues above."""
+                        attempt += 1
+                        continue
+                    else:
+                        with open(log_file, 'a') as log:
+                            log.write("✗ Max retries reached, accepting best effort\n")
+                        verified = "partial"
+                        break
+
+                # All checks passed
+                with open(log_file, 'a') as log:
+                    log.write("✓ Completeness check passed\n")
+                verified = "true"
+                break
+            else:
+                with open(log_file, 'a') as log:
+                    log.write("\n✗ No code extracted from response\n")
+
+                if attempt < max_attempts:
+                    current_prompt = f"""{original_prompt}
+
+IMPORTANT: Your previous response did not contain a properly formatted code block.
+Please respond with ONLY executable code inside a markdown code block like:
+```python
+# your code here
+```"""
+                    attempt += 1
+                    continue
+                else:
+                    status = "failed"
+                    break
+
+        except subprocess.TimeoutExpired:
+            with open(log_file, 'a') as log:
+                log.write("\n✗ Code generation timed out\n")
+            status = "failed"
+            break
+        except Exception as e:
+            with open(log_file, 'a') as log:
+                log.write(f"\n✗ Code generation failed: {e}\n")
+            status = "failed"
+            break
+
+    # Final result
+    with open(log_file, 'a') as log:
+        log.write(f"\n=== Final Result ===\n")
+        log.write(f"Attempts: {attempt}\n")
+        log.write(f"Verified: {verified}\n")
+
+        if Path(output).exists() and Path(output).stat().st_size > 0 and status == "success":
+            log.write(f"✓ Script saved to: {output}\n")
+            log.write(f"✓ Session log: {log_file}\n")
+        elif Path(output).exists() and Path(output).stat().st_size > 0:
+            log.write(f"⚠ Script saved with issues to: {output}\n")
+        else:
+            log.write("✗ No output generated\n")
+
+    # Update metadata
+    end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with open(meta_file, 'r') as f:
+            content = f.read()
+        content = content.replace('STATUS="running"', f'STATUS="{status}"')
+        content = content.replace('END_TIME=""', f'END_TIME="{end_time}"')
+        content = content.replace('ATTEMPTS="0"', f'ATTEMPTS="{attempt}"')
+        content = content.replace('VERIFIED="false"', f'VERIFIED="{verified}"')
+        with open(meta_file, 'w') as f:
+            f.write(content)
+    except:
+        pass
+
+    # Remove from active sessions
+    try:
+        Path(active_file).unlink()
+    except:
+        pass
+
+
+def main():
+    ensure_directories()
+
+    # Check for commands first
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'list':
+            list_sessions()
+            sys.exit(0)
+        elif sys.argv[1] == 'model':
+            list_models()
+            sys.exit(0)
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description='Generate code using Ollama models and extract it to executable files.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Commands:
+  popp list        Show all active and past pop sessions
+  popp model       List all available Ollama models
+
+Verification:
+  By default, popp verifies generated code for syntax errors and completeness.
+  If verification fails, it automatically retries up to 3 times with feedback.
+  Use --no-verify to skip verification for faster (but less reliable) output.
+
+Examples:
+  popp "write a python script that lists files"
+  popp -m llama3.2 "write a csv parser" -o csvcut.py -l python
+  popp -f my-prompt.txt -o output.sh -l bash
+  echo "write a port scanner" | popp -o portscan.py
+'''
+    )
+
+    parser.add_argument('-m', '--model', default=DEFAULT_MODEL,
+                        help=f'Select Ollama model (default: {DEFAULT_MODEL})')
+    parser.add_argument('-f', '--file', dest='input_file',
+                        help='Read prompt from file')
+    parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT,
+                        help=f'Output file path (default: {DEFAULT_OUTPUT})')
+    parser.add_argument('-l', '--lang',
+                        help='Language filter for code extraction (python, bash, etc.)')
+    parser.add_argument('--minimal', action='store_true',
+                        help='Enable minimal mode (strongest prompts + strip comments)')
+    parser.add_argument('--thinking', action='store_true',
+                        help='Show model thinking process (hidden by default)')
+    parser.add_argument('--hidethinking', action='store_true',
+                        help='Explicitly hide model thinking process (default behavior)')
+    parser.add_argument('--no-verify', action='store_true', dest='no_verify',
+                        help='Skip output verification (verification enabled by default)')
+    parser.add_argument('prompt', nargs='?', default=None,
+                        help='The prompt for code generation')
+
+    args = parser.parse_args()
+
+    # Determine hide_thinking (default True unless --thinking specified)
+    hide_thinking = not args.thinking
+
+    # Determine verification
+    do_verify = not args.no_verify
+
+    # Determine input source (priority: file > stdin > argument)
+    prompt = None
+
+    if args.input_file:
+        if not Path(args.input_file).exists():
+            print(f"{Colors.RED}✗ File not found: {args.input_file}{Colors.NC}", file=sys.stderr)
+            sys.exit(1)
+        prompt = Path(args.input_file).read_text()
+    elif not sys.stdin.isatty():
+        stdin_content = sys.stdin.read()
+        if args.prompt:
+            prompt = f"{args.prompt}\n\n{stdin_content}"
+        else:
+            prompt = stdin_content
+    elif args.prompt:
+        prompt = args.prompt
+    else:
+        print(f"{Colors.RED}✗ No prompt provided{Colors.NC}", file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    if not prompt or not prompt.strip():
+        print(f"{Colors.RED}✗ Empty prompt{Colors.NC}", file=sys.stderr)
+        sys.exit(1)
+
+    # Verify model exists
+    if not verify_model_exists(args.model):
+        print(f"{Colors.RED}✗ Model not found: {args.model}{Colors.NC}", file=sys.stderr)
+        print("Available models:", file=sys.stderr)
+        subprocess.run(['ollama', 'list'], stderr=sys.stderr)
+        sys.exit(1)
+
+    # Generate unique session ID
+    session_id = f"popp-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    session_log = SESSIONS_DIR / f"{session_id}.log"
+    session_meta = SESSIONS_DIR / f"{session_id}.meta"
+    session_active = ACTIVE_DIR / f"{session_id}.session"
+
+    # Get incremental output filename
+    output = get_output_filename(args.output)
+
+    # Save session metadata
+    with open(session_meta, 'w') as f:
+        f.write(f'START_TIME="{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}"\n')
+        f.write(f'MODEL_NAME="{args.model}"\n')
+        f.write(f'OUTPUT_FILE="{output}"\n')
+        f.write(f'PROMPT_TEXT="{prompt}"\n')
+        f.write('STATUS="running"\n')
+        f.write('END_TIME=""\n')
+        f.write('ATTEMPTS="0"\n')
+        f.write('VERIFIED="false"\n')
+
+    # Start background generation
+    process = Process(
+        target=run_generation,
+        args=(session_id, args.model, prompt, output, args.lang,
+              str(session_log), str(session_meta), str(session_active),
+              hide_thinking, args.minimal, do_verify, MAX_RETRIES)
+    )
+    process.start()
+
+    # Save PID to active session file
+    with open(session_active, 'w') as f:
+        f.write(str(process.pid))
+
+    # Inform user
+    print(f"{Colors.GREEN}✓ popp session started: {Colors.BLUE}{session_id}{Colors.NC}")
+    print(f"{Colors.GREEN}✓ Model: {Colors.BLUE}{args.model}{Colors.NC}")
+    print(f"{Colors.GREEN}✓ Output will be saved to: {Colors.BLUE}{output}{Colors.NC}")
+    if do_verify:
+        print(f"{Colors.GREEN}✓ Verification: {Colors.BLUE}enabled (max {MAX_RETRIES} retries){Colors.NC}")
+    else:
+        print(f"{Colors.YELLOW}✓ Verification: {Colors.BLUE}disabled{Colors.NC}")
+    print(f"{Colors.GREEN}✓ Session log: {Colors.BLUE}{session_log}{Colors.NC}")
+    print()
+    print(f"{Colors.YELLOW}Generation running in background (PID: {process.pid}){Colors.NC}")
+    print(f"{Colors.YELLOW}Use 'popp list' to check session status{Colors.NC}")
+    print(f"{Colors.YELLOW}Use 'tail -f {session_log}' to follow progress{Colors.NC}")
+
+
+if __name__ == '__main__':
+    main()
