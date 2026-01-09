@@ -19,7 +19,9 @@ A flexible wrapper script for generating code using any Ollama model and automat
 - **Auto Shebang**: Automatically inserts appropriate shebang lines for executable scripts
 - **Output Verification**: Automatic syntax checking and model-based completeness verification
 - **Auto-Retry**: Automatically retries up to 3 times when verification fails, with feedback
+- **Fix Mode**: Fix existing scripts with `-fix:<script>` parameter
 - **Multiple Input Methods**: Command-line, file input, or stdin/pipe support
+- **Pure Python**: Written entirely in Python for portability
 
 ## Installation
 
@@ -72,6 +74,7 @@ pop [options] [prompt]
 | `--thinking` | Show model thinking process (hidden by default) |
 | `--hidethinking` | Explicitly hide model thinking process (default behavior) |
 | `--no-verify` | Skip output verification (verification enabled by default) |
+| `-fix:<script>` | Fix an existing script (output saved as `<script>_popfix`) |
 | `-h` | Show help message |
 
 ### Commands
@@ -106,6 +109,38 @@ pop "write a web scraper"
 # Skip verification for faster output
 pop --no-verify "write a hello world script"
 ```
+
+### Fix Mode
+
+Fix existing scripts using the `-fix:<script>` parameter. This sends your script to the model along with your fix instructions, and outputs a corrected version.
+
+```bash
+# Fix syntax errors and add a shebang
+pop -fix:./myscript.py "add a shebang and fix any syntax errors"
+# Output: ./myscript.py_popfix
+
+# Add error handling to an existing script
+pop -fix:./server.py "add try/except error handling around all file operations"
+# Output: ./server.py_popfix
+
+# Refactor with a specific model
+pop -m codellama -fix:./parser.sh "convert to use getopts for argument parsing"
+# Output: ./parser.sh_popfix
+
+# Fix with minimal mode (strip comments from output)
+pop --minimal -fix:./verbose.py "simplify this script"
+# Output: ./verbose.py_popfix
+```
+
+**How it works:**
+1. Reads the source file
+2. Sends the code + your instructions to the model
+3. Extracts the fixed code from the response
+4. Verifies syntax and completeness (same as generation mode)
+5. Retries up to 3 times if verification fails
+6. Saves output as `<original>_popfix`
+
+The original file is **never modified** - the fixed version is always saved with the `_popfix` suffix.
 
 ### Input Methods
 
@@ -785,6 +820,15 @@ Found a bug or have a feature request? Open an issue or submit a pull request.
 - [Prompt Engineering Guide](https://www.promptingguide.ai/)
 
 ## Changelog
+
+### v4.0 - Python Rewrite & Fix Mode
+- **Complete Python rewrite**: pop is now written entirely in Python (was bash)
+- **Fix mode (`-fix:<script>`)**: Fix existing scripts with AI assistance
+  - Send existing code + instructions to model
+  - Output saved as `<script>_popfix` (original unchanged)
+  - Same verification/retry logic as generation mode
+- **Session ID prefixes**: `pop-` for generation, `pop-fix-` for fix mode
+- **Improved portability**: No bash dependencies, runs anywhere Python runs
 
 ### v3.2 - Output Verification & Auto-Retry
 - **Output verification**: Automatic syntax checking for Python, Bash, JavaScript, Ruby, Perl
