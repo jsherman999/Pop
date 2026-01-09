@@ -12,6 +12,11 @@ A flexible wrapper script for generating code using any Ollama model and automat
 - **Session Tracking**: Saves all sessions with full logs and metadata
 - **Default Model**: Uses `qwen3:latest` by default (configurable with `-m` flag)
 - **Session Management**: View active and past sessions with `pop list`
+- **Model Discovery**: List available models with `pop model`
+- **Minimal Mode**: Generate cleaner code with `--minimal` (stronger prompts + comment stripping)
+- **Hide Thinking**: Model thinking is hidden by default (use `--thinking` to show)
+- **Incremental Naming**: Automatically avoids overwriting files (script.py → script-1.py → script-2.py)
+- **Auto Shebang**: Automatically inserts appropriate shebang lines for executable scripts
 - **Multiple Input Methods**: Command-line, file input, or stdin/pipe support
 
 ## Installation
@@ -59,8 +64,11 @@ pop [options] [prompt]
 |--------|-------------|
 | `-m MODEL` | Select Ollama model (default: qwen3:latest) |
 | `-f FILE` | Read prompt from file |
-| `-o OUTPUT` | Output file path (default: script.py) |
+| `-o OUTPUT` | Output file path (default: script.py, auto-increments if exists) |
 | `-l LANG` | Language filter for code extraction (python, bash, etc.) |
+| `--minimal` | Enable minimal mode (strongest prompts + strip comments) |
+| `--thinking` | Show model thinking process (hidden by default) |
+| `--hidethinking` | Explicitly hide model thinking process (default behavior) |
 | `-h` | Show help message |
 
 ### Commands
@@ -68,6 +76,7 @@ pop [options] [prompt]
 | Command | Description |
 |---------|-------------|
 | `pop list` | Show all active and past pop sessions on this host |
+| `pop model` | List all available Ollama models |
 
 ### Input Methods
 
@@ -747,6 +756,15 @@ Found a bug or have a feature request? Open an issue or submit a pull request.
 - [Prompt Engineering Guide](https://www.promptingguide.ai/)
 
 ## Changelog
+
+### v3.1 - Model Discovery, Minimal Mode & Quality Improvements
+- **`pop model` command**: List all available Ollama models
+- **Minimal mode (`--minimal`)**: Stronger prompts + automatic comment stripping for cleaner code
+- **Automatic shebang insertion**: Scripts automatically get appropriate shebang lines (#!/usr/bin/env python3, #!/bin/bash, etc.)
+- **Incremental file naming**: Output files auto-increment (script.py → script-1.py → script-2.py) to prevent overwrites
+- **Hide thinking by default**: Model thinking process hidden by default, use `--thinking` to show
+- **Improved list ordering**: Past sessions now displayed oldest-first (most recent at bottom)
+- **Comment stripping**: extract-code.py can now strip comments with `--strip-comments` flag
 
 ### v3.0 - Background Execution & Session Management
 - **Background execution**: All code generation runs in background, returns shell immediately
