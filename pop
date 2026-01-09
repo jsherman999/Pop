@@ -1,719 +1,1097 @@
-#!/bin/bash
-# pop - Prompt-Oriented Programming: LLM Code Generator
-# Usage: pop [options] [prompt]
+#!/usr/bin/env python3
+"""
+pop - Prompt-Oriented Programming
+LLM Code Generator using Ollama models
 
-set -e
+Usage: pop [options] [prompt]
+       pop -fix:<script> "instructions to fix the script"
+"""
 
-# Default values
-OUTPUT="script.py"
-LANG=""
-MODEL="qwen3:latest"
-INPUT_FILE=""
-PROMPT=""
-HIDE_THINKING=true  # Hide thinking by default
-MINIMAL_MODE=false  # Minimal mode disabled by default
-VERIFY=true         # Verification enabled by default
-MAX_RETRIES=3       # Maximum retry attempts for verification failures
-POP_DIR="$HOME/.pop"
-SESSIONS_DIR="$POP_DIR/sessions"
-ACTIVE_DIR="$POP_DIR/active"
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from multiprocessing import Process
+from pathlib import Path
+from typing import Optional, Tuple
 
-# Function to get incremental output filename
-get_output_filename() {
-    local base_output="$1"
-    local output="$base_output"
-    local counter=1
+# Colors for terminal output
+class Colors:
+    RED = '\033[0;31m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[0;34m'
+    CYAN = '\033[0;36m'
+    NC = '\033[0m'  # No Color
 
-    # If file doesn't exist, use it as-is
-    if [ ! -f "$output" ]; then
-        echo "$output"
-        return
-    fi
 
-    # Extract directory, basename, and extension
-    local dir=$(dirname "$output")
-    local filename=$(basename "$output")
-    local name="${filename%.*}"
-    local ext="${filename##*.}"
+# Default configuration
+DEFAULT_MODEL = "qwen3:latest"
+DEFAULT_OUTPUT = "script.py"
+MAX_RETRIES = 3
+POP_DIR = Path.home() / ".pop"
+SESSIONS_DIR = POP_DIR / "sessions"
+ACTIVE_DIR = POP_DIR / "active"
 
-    # If no extension (e.g., "script"), treat whole name as basename
-    if [ "$name" = "$ext" ]; then
-        ext=""
-    fi
 
-    # Find available filename
-    while [ -f "$output" ]; do
-        if [ -n "$ext" ]; then
-            output="${dir}/${name}-${counter}.${ext}"
-        else
-            output="${dir}/${filename}-${counter}"
-        fi
-        ((counter++))
-    done
+def ensure_directories():
+    """Create pop directories if they don't exist."""
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    echo "$output"
-}
 
-# Function to detect language from file
-detect_language() {
-    local file="$1"
-    local specified_lang="$2"
+def get_output_filename(base_output: str) -> str:
+    """Get incremental output filename to avoid overwriting existing files."""
+    output = Path(base_output)
 
-    # Use specified language if provided
-    if [ -n "$specified_lang" ]; then
-        echo "$specified_lang"
-        return
-    fi
+    if not output.exists():
+        return str(output)
+
+    # Extract components
+    parent = output.parent
+    stem = output.stem
+    suffix = output.suffix
+
+    counter = 1
+    while True:
+        if suffix:
+            new_output = parent / f"{stem}-{counter}{suffix}"
+        else:
+            new_output = parent / f"{output.name}-{counter}"
+
+        if not new_output.exists():
+            return str(new_output)
+        counter += 1
+
+
+def detect_language(filepath: str, specified_lang: Optional[str] = None) -> str:
+    """Detect programming language from file."""
+    if specified_lang:
+        return specified_lang
+
+    path = Path(filepath)
 
     # Check shebang first
-    if [ -f "$file" ]; then
-        local shebang=$(head -1 "$file" 2>/dev/null)
-        if [[ "$shebang" == *"python"* ]]; then echo "python"; return; fi
-        if [[ "$shebang" == *"bash"* ]] || [[ "$shebang" == *"/bin/sh"* ]]; then echo "bash"; return; fi
-        if [[ "$shebang" == *"node"* ]]; then echo "javascript"; return; fi
-        if [[ "$shebang" == *"ruby"* ]]; then echo "ruby"; return; fi
-        if [[ "$shebang" == *"perl"* ]]; then echo "perl"; return; fi
-    fi
+    if path.exists():
+        try:
+            with open(path, 'r') as f:
+                first_line = f.readline()
+                if 'python' in first_line:
+                    return 'python'
+                if 'bash' in first_line or '/bin/sh' in first_line:
+                    return 'bash'
+                if 'node' in first_line:
+                    return 'javascript'
+                if 'ruby' in first_line:
+                    return 'ruby'
+                if 'perl' in first_line:
+                    return 'perl'
+        except:
+            pass
 
     # Fall back to extension
-    local ext="${file##*.}"
-    case "$ext" in
-        py) echo "python" ;;
-        sh|bash) echo "bash" ;;
-        js) echo "javascript" ;;
-        rb) echo "ruby" ;;
-        pl) echo "perl" ;;
-        php) echo "php" ;;
-        *) echo "unknown" ;;
-    esac
-}
+    ext_map = {
+        '.py': 'python',
+        '.sh': 'bash',
+        '.bash': 'bash',
+        '.js': 'javascript',
+        '.rb': 'ruby',
+        '.pl': 'perl',
+        '.php': 'php',
+    }
+    return ext_map.get(path.suffix, 'unknown')
 
-# Function to verify syntax of generated code
-verify_syntax() {
-    local file="$1"
-    local lang="$2"
 
-    # Return empty string (success) if file doesn't exist or is empty
-    if [ ! -s "$file" ]; then
-        echo "File is empty or does not exist"
-        return
-    fi
+def verify_syntax(filepath: str, lang: str) -> str:
+    """Verify syntax of generated code. Returns empty string on success, error message on failure."""
+    path = Path(filepath)
 
-    case "$lang" in
-        python|py)
-            python3 -m py_compile "$file" 2>&1 && echo ""
-            ;;
-        bash|sh|shell)
-            bash -n "$file" 2>&1 && echo ""
-            ;;
-        javascript|js)
-            if command -v node &> /dev/null; then
-                node --check "$file" 2>&1 && echo ""
-            else
-                echo ""  # Can't verify, assume OK
-            fi
-            ;;
-        ruby|rb)
-            if command -v ruby &> /dev/null; then
-                ruby -c "$file" 2>&1 | grep -v "Syntax OK" || echo ""
-            else
-                echo ""
-            fi
-            ;;
-        perl|pl)
-            if command -v perl &> /dev/null; then
-                perl -c "$file" 2>&1 | grep -v "syntax OK" || echo ""
-            else
-                echo ""
-            fi
-            ;;
-        *)
-            echo ""  # Can't verify unknown languages, assume OK
-            ;;
-    esac
-}
+    if not path.exists() or path.stat().st_size == 0:
+        return "File is empty or does not exist"
 
-# Function to verify completeness using the model
-verify_completeness() {
-    local model="$1"
-    local original_prompt="$2"
-    local code_file="$3"
-    local hide_thinking="$4"
+    try:
+        if lang in ('python', 'py'):
+            result = subprocess.run(
+                ['python3', '-m', 'py_compile', filepath],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return result.stderr.strip()
+            return ""
 
-    local code=$(cat "$code_file")
+        elif lang in ('bash', 'sh', 'shell'):
+            result = subprocess.run(
+                ['bash', '-n', filepath],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return result.stderr.strip()
+            return ""
 
-    local verify_prompt="You are a code reviewer. Analyze if this code fully implements the requirements.
+        elif lang in ('javascript', 'js'):
+            if subprocess.run(['which', 'node'], capture_output=True).returncode == 0:
+                result = subprocess.run(
+                    ['node', '--check', filepath],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    return result.stderr.strip()
+            return ""
+
+        elif lang in ('ruby', 'rb'):
+            if subprocess.run(['which', 'ruby'], capture_output=True).returncode == 0:
+                result = subprocess.run(
+                    ['ruby', '-c', filepath],
+                    capture_output=True, text=True
+                )
+                if 'Syntax OK' not in result.stdout and result.returncode != 0:
+                    return result.stderr.strip()
+            return ""
+
+        elif lang in ('perl', 'pl'):
+            if subprocess.run(['which', 'perl'], capture_output=True).returncode == 0:
+                result = subprocess.run(
+                    ['perl', '-c', filepath],
+                    capture_output=True, text=True
+                )
+                if 'syntax OK' not in result.stderr and result.returncode != 0:
+                    return result.stderr.strip()
+            return ""
+
+        else:
+            return ""  # Can't verify unknown languages, assume OK
+
+    except Exception as e:
+        return str(e)
+
+
+def verify_completeness(model: str, original_prompt: str, code_file: str, hide_thinking: bool) -> str:
+    """Verify completeness using the model. Returns JSON response."""
+    try:
+        with open(code_file, 'r') as f:
+            code = f.read()
+    except:
+        return '{"complete": true}'
+
+    verify_prompt = f'''You are a code reviewer. Analyze if this code fully implements the requirements.
 
 ORIGINAL REQUIREMENTS:
-$original_prompt
+{original_prompt}
 
 GENERATED CODE:
-$code
+{code}
 
 Respond with ONLY valid JSON (no markdown, no code blocks, no explanation):
-{\"complete\": true} if the code fully meets requirements and is syntactically complete
-{\"complete\": false, \"issues\": [\"issue1\", \"issue2\"]} if incomplete or broken
+{{"complete": true}} if the code fully meets requirements and is syntactically complete
+{{"complete": false, "issues": ["issue1", "issue2"]}} if incomplete or broken
 
 Check for:
 - Code appears truncated or cut off mid-statement
 - Missing required functionality from the prompt
 - Incomplete function definitions or class structures
-- Missing imports or dependencies that would cause runtime errors"
+- Missing imports or dependencies that would cause runtime errors'''
 
-    local ollama_opts=()
-    if [ "$hide_thinking" = "true" ]; then
-        ollama_opts+=(--hidethinking)
-    fi
+    cmd = ['ollama', 'run']
+    if hide_thinking:
+        cmd.append('--hidethinking')
+    cmd.extend([model, verify_prompt])
 
-    # Run verification and capture response
-    local response=$(ollama run "${ollama_opts[@]}" "$model" "$verify_prompt" 2>/dev/null)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        response = result.stdout
 
-    # Try to extract JSON from response (handle markdown code blocks)
-    local json_response=$(echo "$response" | grep -o '{[^}]*}' | head -1)
+        # Try to extract JSON from response
+        match = re.search(r'\{[^}]*\}', response)
+        if match:
+            return match.group()
+        return '{"complete": true}'
+    except:
+        return '{"complete": true}'
 
-    if [ -z "$json_response" ]; then
-        # If no JSON found, assume complete (fail-safe)
-        echo '{"complete": true}'
-    else
-        echo "$json_response"
-    fi
-}
 
-# Function to extract issues from verification response
-extract_issues() {
-    local json="$1"
-    # Extract issues array content, handling various formats
-    echo "$json" | sed -n 's/.*"issues"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr -d '"' | tr ',' '\n' | sed 's/^[[:space:]]*/- /'
-}
+def extract_issues(json_str: str) -> str:
+    """Extract issues from verification response."""
+    try:
+        data = json.loads(json_str)
+        issues = data.get('issues', [])
+        return '\n'.join(f'- {issue}' for issue in issues)
+    except:
+        return ""
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
 
-# Create pop directories if they don't exist
-mkdir -p "$SESSIONS_DIR" "$ACTIVE_DIR"
+def ensure_shebang(code: str, language: Optional[str] = None) -> str:
+    """Ensure code has a valid shebang line at the beginning."""
+    lines = code.split('\n')
 
-# Function to show usage
-show_usage() {
-    cat << EOF
-Usage: pop [options] [prompt]
+    if lines and lines[0].strip().startswith('#!'):
+        return code
 
-Generate code using Ollama models and extract it to executable files.
+    # Detect language if not specified
+    if not language:
+        if 'import ' in code or 'def ' in code or 'class ' in code:
+            language = 'python'
+        elif 'function ' in code or 'const ' in code or 'let ' in code:
+            language = 'javascript'
+        elif 'echo ' in code or '[[' in code or 'if [' in code:
+            language = 'bash'
 
-Options:
-  -m MODEL        Select Ollama model (default: qwen3:latest)
-  -f FILE         Read prompt from file
-  -o OUTPUT       Output file path (default: script.py)
-  -l LANG         Language filter for code extraction (python, bash, etc.)
-  --minimal       Enable minimal mode (strongest prompts + strip comments)
-  --thinking      Show model thinking process (hidden by default)
-  --hidethinking  Explicitly hide model thinking process (default behavior)
-  --no-verify     Skip output verification (verification enabled by default)
-  -h              Show this help message
+    # Determine appropriate shebang
+    shebang_map = {
+        'python': '#!/usr/bin/env python3',
+        'py': '#!/usr/bin/env python3',
+        'bash': '#!/bin/bash',
+        'sh': '#!/bin/bash',
+        'shell': '#!/bin/bash',
+        'javascript': '#!/usr/bin/env node',
+        'js': '#!/usr/bin/env node',
+        'node': '#!/usr/bin/env node',
+        'ruby': '#!/usr/bin/env ruby',
+        'rb': '#!/usr/bin/env ruby',
+        'perl': '#!/usr/bin/env perl',
+        'pl': '#!/usr/bin/env perl',
+        'php': '#!/usr/bin/env php',
+    }
 
+    shebang = shebang_map.get(language)
+    if shebang:
+        return f"{shebang}\n{code}"
+    return code
+
+
+def strip_comments(code: str, language: Optional[str] = None) -> str:
+    """Remove comments from code while preserving functionality."""
+    if not language:
+        if code.strip().startswith('#!/usr/bin/env python') or 'import ' in code or 'def ' in code:
+            language = 'python'
+        elif code.strip().startswith('#!/bin/bash') or code.strip().startswith('#!/bin/sh'):
+            language = 'bash'
+
+    if language in ('python', 'py'):
+        lines = code.split('\n')
+        cleaned_lines = []
+        for i, line in enumerate(lines):
+            if i == 0 and line.strip().startswith('#!'):
+                cleaned_lines.append(line)
+            elif '#' in line:
+                # Simple approach: remove # comments not in strings
+                in_string = False
+                quote_char = None
+                result = []
+                for j, char in enumerate(line):
+                    if char in ('"', "'") and (j == 0 or line[j-1] != '\\'):
+                        if not in_string:
+                            in_string = True
+                            quote_char = char
+                        elif char == quote_char:
+                            in_string = False
+                    if char == '#' and not in_string:
+                        break
+                    result.append(char)
+                cleaned_lines.append(''.join(result).rstrip())
+            else:
+                cleaned_lines.append(line)
+        code = '\n'.join(cleaned_lines)
+        # Remove docstrings
+        code = re.sub(r'^\s*""".*?"""\s*$', '', code, flags=re.MULTILINE | re.DOTALL)
+        code = re.sub(r"^\s*'''.*?'''\s*$", '', code, flags=re.MULTILINE | re.DOTALL)
+
+    elif language in ('bash', 'sh', 'shell'):
+        lines = code.split('\n')
+        cleaned_lines = []
+        for i, line in enumerate(lines):
+            if i == 0 and line.strip().startswith('#!'):
+                cleaned_lines.append(line)
+            elif '#' in line:
+                idx = line.find('#')
+                cleaned_lines.append(line[:idx].rstrip())
+            else:
+                cleaned_lines.append(line)
+        code = '\n'.join(cleaned_lines)
+
+    elif language in ('javascript', 'js', 'typescript', 'ts'):
+        code = re.sub(r'//.*$', '', code, flags=re.MULTILINE)
+        code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+
+    # Remove excessive blank lines
+    code = re.sub(r'\n\s*\n\s*\n+', '\n\n', code)
+    return code
+
+
+def extract_code_blocks(text: str, language: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """Extract code blocks from markdown-formatted text."""
+    pattern = r'```(\w+)?\n(.*?)```'
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    if not matches:
+        return (text, language)
+
+    if language:
+        matches = [(lang, code) for lang, code in matches if lang and lang.lower() == language.lower()]
+
+    if not matches:
+        return ("", language)
+
+    detected_lang, code = matches[0]
+    return (code.strip(), detected_lang or language)
+
+
+def list_sessions():
+    """List all active and past sessions."""
+    print(f"{Colors.CYAN}=== Past Sessions (Last 20) ==={Colors.NC}")
+
+    past_count = 0
+    if SESSIONS_DIR.exists():
+        meta_files = sorted(SESSIONS_DIR.glob("*.meta"), key=lambda x: x.stat().st_mtime)[-20:]
+
+        for meta_file in meta_files:
+            session_id = meta_file.stem
+            active_file = ACTIVE_DIR / f"{session_id}.session"
+
+            if active_file.exists():
+                continue  # Skip active sessions
+
+            try:
+                meta = {}
+                with open(meta_file) as f:
+                    for line in f:
+                        if '=' in line:
+                            key, val = line.strip().split('=', 1)
+                            meta[key] = val.strip('"')
+
+                status = meta.get('STATUS', '')
+                if status == 'failed':
+                    icon, color = '✗', Colors.RED
+                else:
+                    icon, color = '✓', Colors.GREEN
+
+                print(f"{color}{icon}{Colors.NC} {session_id}")
+                print(f"  Time: {meta.get('START_TIME', '')} → {meta.get('END_TIME', '')}")
+                print(f"  Model: {meta.get('MODEL_NAME', '')}")
+                print(f"  Output: {meta.get('OUTPUT_FILE', '')}")
+                prompt_text = meta.get('PROMPT_TEXT', '')[:60]
+                print(f"  Prompt: {prompt_text}...")
+                print(f"  Log: {SESSIONS_DIR}/{session_id}.log")
+                print()
+                past_count += 1
+            except:
+                pass
+
+    if past_count == 0:
+        print(f"{Colors.YELLOW}No past sessions{Colors.NC}")
+
+    print()
+    print(f"{Colors.CYAN}=== Active Sessions ==={Colors.NC}")
+
+    active_count = 0
+    if ACTIVE_DIR.exists():
+        for session_file in ACTIVE_DIR.glob("*.session"):
+            session_id = session_file.stem
+            try:
+                pid = int(session_file.read_text().strip())
+
+                # Check if process is running
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    session_file.unlink()
+                    continue
+
+                meta_file = SESSIONS_DIR / f"{session_id}.meta"
+                if meta_file.exists():
+                    meta = {}
+                    with open(meta_file) as f:
+                        for line in f:
+                            if '=' in line:
+                                key, val = line.strip().split('=', 1)
+                                meta[key] = val.strip('"')
+
+                    print(f"{Colors.GREEN}● {Colors.NC}{session_id} (PID: {pid})")
+                    print(f"  Started: {meta.get('START_TIME', '')}")
+                    print(f"  Model: {meta.get('MODEL_NAME', '')}")
+                    print(f"  Output: {meta.get('OUTPUT_FILE', '')}")
+                    prompt_text = meta.get('PROMPT_TEXT', '')[:60]
+                    print(f"  Prompt: {prompt_text}...")
+                    print()
+                    active_count += 1
+            except:
+                pass
+
+    if active_count == 0:
+        print(f"{Colors.YELLOW}No active sessions{Colors.NC}")
+
+
+def list_models():
+    """List available Ollama models."""
+    print(f"{Colors.CYAN}=== Available Ollama Models ==={Colors.NC}")
+
+    try:
+        result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
+        if result.returncode != 0 or not result.stdout.strip():
+            print(f"{Colors.RED}✗ No models found or Ollama is not running{Colors.NC}")
+            print(f"{Colors.YELLOW}Install models with: ollama pull <model>{Colors.NC}")
+            sys.exit(1)
+
+        print(result.stdout)
+    except FileNotFoundError:
+        print(f"{Colors.RED}✗ Ollama not found. Please install Ollama first.{Colors.NC}")
+        sys.exit(1)
+
+
+def verify_model_exists(model: str) -> bool:
+    """Check if the specified model exists."""
+    try:
+        result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
+        return model in result.stdout
+    except:
+        return False
+
+
+def run_generation(session_id: str, model: str, original_prompt: str, output: str,
+                   lang: Optional[str], log_file: str, meta_file: str, active_file: str,
+                   hide_thinking: bool, minimal_mode: bool, do_verify: bool, max_retries: int):
+    """Run the code generation process with verification loop."""
+
+    # Write session header to log
+    with open(log_file, 'a') as log:
+        log.write(f"=== pop Session: {session_id} ===\n")
+        log.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Model: {model}\n")
+        log.write(f"Output: {output}\n")
+        log.write(f"Verification: {do_verify}\n")
+        log.write(f"Prompt: {original_prompt}\n\n")
+
+    # Verification loop
+    attempt = 1
+    max_attempts = max_retries + 1
+    status = "success"
+    verified = "false"
+    current_prompt = original_prompt
+
+    while attempt <= max_attempts:
+        with open(log_file, 'a') as log:
+            log.write(f"=== Generation Attempt {attempt}/{max_attempts} ===\n")
+
+        # Build enhanced prompt
+        if minimal_mode:
+            enhanced_prompt = f"""{current_prompt}
+
+CRITICAL INSTRUCTIONS:
+- Output ONLY executable code in a single code block
+- NO explanations, NO comments, NO documentation
+- NO text before or after the code block
+- Code must be production-ready and executable immediately"""
+        else:
+            enhanced_prompt = f"""{current_prompt}
+
+IMPORTANT: Respond with ONLY the executable code inside a single code block. No explanations, no comments, no text before or after the code block."""
+
+        # Run ollama
+        cmd = ['ollama', 'run']
+        if hide_thinking:
+            cmd.append('--hidethinking')
+        cmd.extend([model, enhanced_prompt])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            response = result.stdout
+
+            # Log raw response
+            with open(log_file, 'a') as log:
+                log.write(response + "\n")
+
+            # Extract code
+            code, detected_lang = extract_code_blocks(response, lang)
+
+            if code:
+                # Ensure shebang
+                code = ensure_shebang(code, detected_lang or lang)
+
+                # Strip comments if minimal mode
+                if minimal_mode:
+                    code = strip_comments(code, detected_lang or lang)
+
+                # Write output file
+                with open(output, 'w') as f:
+                    f.write(code)
+                os.chmod(output, 0o755)
+
+                # Skip verification if disabled
+                if not do_verify:
+                    with open(log_file, 'a') as log:
+                        log.write("\n=== Result (verification skipped) ===\n")
+                        log.write(f"✓ Script saved to: {output}\n")
+                    verified = "skipped"
+                    break
+
+                # Detect language for syntax checking
+                detected = detect_language(output, lang)
+                with open(log_file, 'a') as log:
+                    log.write(f"\n=== Verification (attempt {attempt}) ===\n")
+                    log.write(f"Detected language: {detected}\n")
+
+                # Step 1: Syntax verification
+                syntax_result = verify_syntax(output, detected)
+                if syntax_result:
+                    with open(log_file, 'a') as log:
+                        log.write(f"✗ Syntax error: {syntax_result}\n")
+
+                    if attempt < max_attempts:
+                        current_prompt = f"""{original_prompt}
+
+IMPORTANT: Your previous attempt had a syntax error:
+{syntax_result}
+
+Please generate COMPLETE, syntactically correct code that compiles/parses without errors."""
+                        attempt += 1
+                        continue
+                    else:
+                        with open(log_file, 'a') as log:
+                            log.write("✗ Max retries reached with syntax errors\n")
+                        status = "failed"
+                        break
+
+                with open(log_file, 'a') as log:
+                    log.write("✓ Syntax check passed\n")
+
+                # Step 2: Completeness verification
+                with open(log_file, 'a') as log:
+                    log.write("Running completeness check...\n")
+
+                completeness_result = verify_completeness(model, original_prompt, output, hide_thinking)
+
+                with open(log_file, 'a') as log:
+                    log.write(f"Completeness result: {completeness_result}\n")
+
+                if '"complete": false' in completeness_result or '"complete":false' in completeness_result:
+                    issues = extract_issues(completeness_result)
+                    with open(log_file, 'a') as log:
+                        log.write(f"✗ Completeness check failed:\n{issues}\n")
+
+                    if attempt < max_attempts:
+                        current_prompt = f"""{original_prompt}
+
+IMPORTANT: Your previous attempt was incomplete or had issues:
+{issues}
+
+Please generate a COMPLETE, working implementation that addresses ALL requirements and issues above."""
+                        attempt += 1
+                        continue
+                    else:
+                        with open(log_file, 'a') as log:
+                            log.write("✗ Max retries reached, accepting best effort\n")
+                        verified = "partial"
+                        break
+
+                # All checks passed
+                with open(log_file, 'a') as log:
+                    log.write("✓ Completeness check passed\n")
+                verified = "true"
+                break
+            else:
+                with open(log_file, 'a') as log:
+                    log.write("\n✗ No code extracted from response\n")
+
+                if attempt < max_attempts:
+                    current_prompt = f"""{original_prompt}
+
+IMPORTANT: Your previous response did not contain a properly formatted code block.
+Please respond with ONLY executable code inside a markdown code block like:
+```python
+# your code here
+```"""
+                    attempt += 1
+                    continue
+                else:
+                    status = "failed"
+                    break
+
+        except subprocess.TimeoutExpired:
+            with open(log_file, 'a') as log:
+                log.write("\n✗ Code generation timed out\n")
+            status = "failed"
+            break
+        except Exception as e:
+            with open(log_file, 'a') as log:
+                log.write(f"\n✗ Code generation failed: {e}\n")
+            status = "failed"
+            break
+
+    # Final result
+    with open(log_file, 'a') as log:
+        log.write(f"\n=== Final Result ===\n")
+        log.write(f"Attempts: {attempt}\n")
+        log.write(f"Verified: {verified}\n")
+
+        if Path(output).exists() and Path(output).stat().st_size > 0 and status == "success":
+            log.write(f"✓ Script saved to: {output}\n")
+            log.write(f"✓ Session log: {log_file}\n")
+        elif Path(output).exists() and Path(output).stat().st_size > 0:
+            log.write(f"⚠ Script saved with issues to: {output}\n")
+        else:
+            log.write("✗ No output generated\n")
+
+    # Update metadata
+    end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with open(meta_file, 'r') as f:
+            content = f.read()
+        content = content.replace('STATUS="running"', f'STATUS="{status}"')
+        content = content.replace('END_TIME=""', f'END_TIME="{end_time}"')
+        content = content.replace('ATTEMPTS="0"', f'ATTEMPTS="{attempt}"')
+        content = content.replace('VERIFIED="false"', f'VERIFIED="{verified}"')
+        with open(meta_file, 'w') as f:
+            f.write(content)
+    except:
+        pass
+
+    # Remove from active sessions
+    try:
+        Path(active_file).unlink()
+    except:
+        pass
+
+
+def run_fix(session_id: str, model: str, fix_prompt: str, source_file: str, output: str,
+            lang: Optional[str], log_file: str, meta_file: str, active_file: str,
+            hide_thinking: bool, minimal_mode: bool, do_verify: bool, max_retries: int):
+    """Run the code fix process with verification loop."""
+
+    # Read the source file
+    try:
+        with open(source_file, 'r') as f:
+            original_code = f.read()
+    except Exception as e:
+        with open(log_file, 'a') as log:
+            log.write(f"✗ Failed to read source file: {e}\n")
+        return
+
+    # Write session header to log
+    with open(log_file, 'a') as log:
+        log.write(f"=== pop Fix Session: {session_id} ===\n")
+        log.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Model: {model}\n")
+        log.write(f"Source: {source_file}\n")
+        log.write(f"Output: {output}\n")
+        log.write(f"Verification: {do_verify}\n")
+        log.write(f"Fix Instructions: {fix_prompt}\n\n")
+        log.write(f"=== Original Code ===\n{original_code}\n\n")
+
+    # Build the fix prompt with original code context
+    base_fix_prompt = f"""Here is an existing script that needs to be fixed/modified:
+
+```
+{original_code}
+```
+
+TASK: {fix_prompt}
+
+Respond with the COMPLETE fixed/modified script. Output ONLY the executable code inside a single code block. Include ALL the original code with your fixes applied - do not omit any parts."""
+
+    # Verification loop
+    attempt = 1
+    max_attempts = max_retries + 1
+    status = "success"
+    verified = "false"
+    current_prompt = base_fix_prompt
+
+    while attempt <= max_attempts:
+        with open(log_file, 'a') as log:
+            log.write(f"=== Fix Attempt {attempt}/{max_attempts} ===\n")
+
+        # Build enhanced prompt
+        if minimal_mode:
+            enhanced_prompt = f"""{current_prompt}
+
+CRITICAL INSTRUCTIONS:
+- Output ONLY the complete fixed executable code in a single code block
+- NO explanations, NO comments about changes, NO documentation
+- NO text before or after the code block
+- Include the ENTIRE script, not just the changed parts"""
+        else:
+            enhanced_prompt = current_prompt
+
+        # Run ollama
+        cmd = ['ollama', 'run']
+        if hide_thinking:
+            cmd.append('--hidethinking')
+        cmd.extend([model, enhanced_prompt])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            response = result.stdout
+
+            # Log raw response
+            with open(log_file, 'a') as log:
+                log.write(response + "\n")
+
+            # Extract code
+            code, detected_lang = extract_code_blocks(response, lang)
+
+            if code:
+                # Ensure shebang
+                code = ensure_shebang(code, detected_lang or lang)
+
+                # Strip comments if minimal mode
+                if minimal_mode:
+                    code = strip_comments(code, detected_lang or lang)
+
+                # Write output file
+                with open(output, 'w') as f:
+                    f.write(code)
+                os.chmod(output, 0o755)
+
+                # Skip verification if disabled
+                if not do_verify:
+                    with open(log_file, 'a') as log:
+                        log.write("\n=== Result (verification skipped) ===\n")
+                        log.write(f"✓ Fixed script saved to: {output}\n")
+                    verified = "skipped"
+                    break
+
+                # Detect language for syntax checking
+                detected = detect_language(output, lang)
+                with open(log_file, 'a') as log:
+                    log.write(f"\n=== Verification (attempt {attempt}) ===\n")
+                    log.write(f"Detected language: {detected}\n")
+
+                # Step 1: Syntax verification
+                syntax_result = verify_syntax(output, detected)
+                if syntax_result:
+                    with open(log_file, 'a') as log:
+                        log.write(f"✗ Syntax error: {syntax_result}\n")
+
+                    if attempt < max_attempts:
+                        current_prompt = f"""{base_fix_prompt}
+
+IMPORTANT: Your previous fix attempt had a syntax error:
+{syntax_result}
+
+Please provide the COMPLETE fixed script with correct syntax."""
+                        attempt += 1
+                        continue
+                    else:
+                        with open(log_file, 'a') as log:
+                            log.write("✗ Max retries reached with syntax errors\n")
+                        status = "failed"
+                        break
+
+                with open(log_file, 'a') as log:
+                    log.write("✓ Syntax check passed\n")
+
+                # Step 2: Completeness verification
+                with open(log_file, 'a') as log:
+                    log.write("Running completeness check...\n")
+
+                completeness_result = verify_completeness(model, fix_prompt, output, hide_thinking)
+
+                with open(log_file, 'a') as log:
+                    log.write(f"Completeness result: {completeness_result}\n")
+
+                if '"complete": false' in completeness_result or '"complete":false' in completeness_result:
+                    issues = extract_issues(completeness_result)
+                    with open(log_file, 'a') as log:
+                        log.write(f"✗ Completeness check failed:\n{issues}\n")
+
+                    if attempt < max_attempts:
+                        current_prompt = f"""{base_fix_prompt}
+
+IMPORTANT: Your previous fix attempt was incomplete or had issues:
+{issues}
+
+Please provide the COMPLETE fixed script that addresses ALL the requested changes."""
+                        attempt += 1
+                        continue
+                    else:
+                        with open(log_file, 'a') as log:
+                            log.write("✗ Max retries reached, accepting best effort\n")
+                        verified = "partial"
+                        break
+
+                # All checks passed
+                with open(log_file, 'a') as log:
+                    log.write("✓ Completeness check passed\n")
+                verified = "true"
+                break
+            else:
+                with open(log_file, 'a') as log:
+                    log.write("\n✗ No code extracted from response\n")
+
+                if attempt < max_attempts:
+                    current_prompt = f"""{base_fix_prompt}
+
+IMPORTANT: Your previous response did not contain a properly formatted code block.
+Please respond with the COMPLETE fixed script inside a markdown code block."""
+                    attempt += 1
+                    continue
+                else:
+                    status = "failed"
+                    break
+
+        except subprocess.TimeoutExpired:
+            with open(log_file, 'a') as log:
+                log.write("\n✗ Fix operation timed out\n")
+            status = "failed"
+            break
+        except Exception as e:
+            with open(log_file, 'a') as log:
+                log.write(f"\n✗ Fix operation failed: {e}\n")
+            status = "failed"
+            break
+
+    # Final result
+    with open(log_file, 'a') as log:
+        log.write(f"\n=== Final Result ===\n")
+        log.write(f"Attempts: {attempt}\n")
+        log.write(f"Verified: {verified}\n")
+
+        if Path(output).exists() and Path(output).stat().st_size > 0 and status == "success":
+            log.write(f"✓ Fixed script saved to: {output}\n")
+            log.write(f"✓ Session log: {log_file}\n")
+        elif Path(output).exists() and Path(output).stat().st_size > 0:
+            log.write(f"⚠ Fixed script saved with issues to: {output}\n")
+        else:
+            log.write("✗ No output generated\n")
+
+    # Update metadata
+    end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with open(meta_file, 'r') as f:
+            content = f.read()
+        content = content.replace('STATUS="running"', f'STATUS="{status}"')
+        content = content.replace('END_TIME=""', f'END_TIME="{end_time}"')
+        content = content.replace('ATTEMPTS="0"', f'ATTEMPTS="{attempt}"')
+        content = content.replace('VERIFIED="false"', f'VERIFIED="{verified}"')
+        with open(meta_file, 'w') as f:
+            f.write(content)
+    except:
+        pass
+
+    # Remove from active sessions
+    try:
+        Path(active_file).unlink()
+    except:
+        pass
+
+
+def main():
+    ensure_directories()
+
+    # Check for commands first
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'list':
+            list_sessions()
+            sys.exit(0)
+        elif sys.argv[1] == 'model':
+            list_models()
+            sys.exit(0)
+
+    # Pre-process arguments to extract -fix: parameter
+    fix_file = None
+    filtered_args = []
+    for arg in sys.argv[1:]:
+        if arg.startswith('-fix:'):
+            fix_file = arg[5:]  # Extract filename after -fix:
+        else:
+            filtered_args.append(arg)
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description='Generate code using Ollama models and extract it to executable files.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
 Commands:
-  pop list        Show all active and past pop sessions
-  pop model       List all available Ollama models
+  pop list         Show all active and past pop sessions
+  pop model        List all available Ollama models
+
+Fix Mode:
+  pop -fix:<script> "instructions"   Fix an existing script
+  Output will be saved to <script>_popfix
 
 Verification:
   By default, pop verifies generated code for syntax errors and completeness.
   If verification fails, it automatically retries up to 3 times with feedback.
   Use --no-verify to skip verification for faster (but less reliable) output.
 
-Input Methods:
-  1. Command-line argument: pop "write a script..."
-  2. File input: pop -f prompt.txt
-  3. Stdin: echo "write a script..." | pop
-
 Examples:
   pop "write a python script that lists files"
   pop -m llama3.2 "write a csv parser" -o csvcut.py -l python
   pop -f my-prompt.txt -o output.sh -l bash
   echo "write a port scanner" | pop -o portscan.py
-  cat requirements.txt | pop "create a script from these requirements"
-
-Model Selection:
-  Without -m flag, defaults to qwen3:latest.
-  Use -m to specify a different model from: ollama list
-
-Output Files:
-  - Your script file (executable)
-  - Session logs in ~/.pop/sessions/
-EOF
-}
-
-# Function to list sessions
-list_sessions() {
-    echo -e "${CYAN}=== Past Sessions (Last 20) ===${NC}"
-
-    local past_count=0
-    if [ -d "$SESSIONS_DIR" ]; then
-        # List sessions sorted by timestamp, oldest first (most recent last)
-        for meta_file in $(ls -t "$SESSIONS_DIR"/*.meta 2>/dev/null | head -20 | tail -r); do
-            if [ -f "$meta_file" ]; then
-                source "$meta_file"
-                local session_id=$(basename "$meta_file" .meta)
-
-                # Check if this session is active
-                if [ -f "$ACTIVE_DIR/$session_id.session" ]; then
-                    continue  # Skip active sessions (shown below)
-                fi
-
-                local status_icon="✓"
-                local status_color="$GREEN"
-                if [ "$STATUS" = "failed" ]; then
-                    status_icon="✗"
-                    status_color="$RED"
-                fi
-
-                echo -e "${status_color}${status_icon}${NC} $session_id"
-                echo -e "  Time: $START_TIME → $END_TIME"
-                echo -e "  Model: $MODEL_NAME"
-                echo -e "  Output: $OUTPUT_FILE"
-                echo -e "  Prompt: ${PROMPT_TEXT:0:60}..."
-                echo -e "  Log: $SESSIONS_DIR/$session_id.log"
-                echo ""
-                ((past_count++))
-            fi
-        done
-    fi
-
-    if [ $past_count -eq 0 ]; then
-        echo -e "${YELLOW}No past sessions${NC}"
-    fi
-
-    echo ""
-    echo -e "${CYAN}=== Active Sessions ===${NC}"
-
-    local active_count=0
-    if [ -d "$ACTIVE_DIR" ] && [ "$(ls -A "$ACTIVE_DIR" 2>/dev/null)" ]; then
-        for session_file in "$ACTIVE_DIR"/*.session; do
-            if [ -f "$session_file" ]; then
-                local session_id=$(basename "$session_file" .session)
-                local pid=$(cat "$session_file")
-
-                if kill -0 "$pid" 2>/dev/null; then
-                    # Process is still running
-                    local session_meta="$SESSIONS_DIR/$session_id.meta"
-                    if [ -f "$session_meta" ]; then
-                        source "$session_meta"
-                        echo -e "${GREEN}● ${NC}$session_id (PID: $pid)"
-                        echo -e "  Started: $START_TIME"
-                        echo -e "  Model: $MODEL_NAME"
-                        echo -e "  Output: $OUTPUT_FILE"
-                        echo -e "  Prompt: ${PROMPT_TEXT:0:60}..."
-                        echo ""
-                    fi
-                    ((active_count++))
-                else
-                    # Process finished, clean up
-                    rm -f "$session_file"
-                fi
-            fi
-        done
-    fi
-
-    if [ $active_count -eq 0 ]; then
-        echo -e "${YELLOW}No active sessions${NC}"
-    fi
-
-    exit 0
-}
-
-# Function to list available models
-list_models() {
-    echo -e "${CYAN}=== Available Ollama Models ===${NC}"
-
-    local models=$(ollama list 2>/dev/null)
-
-    if [ -z "$models" ]; then
-        echo -e "${RED}✗ No models found or Ollama is not running${NC}"
-        echo -e "${YELLOW}Install models with: ollama pull <model>${NC}"
-        exit 1
-    fi
-
-    # Print the models (includes header from ollama list)
-    echo "$models"
-
-    exit 0
-}
-
-# Check if first argument is "list" or "model"
-if [ "$1" = "list" ]; then
-    list_sessions
-fi
-
-if [ "$1" = "model" ]; then
-    list_models
-fi
-
-# Function to list and select model
-select_model() {
-    echo -e "${YELLOW}Available Ollama models:${NC}" >&2
-
-    # Get list of models, skip header line
-    local models=($(ollama list | tail -n +2 | awk '{print $1}'))
-
-    if [ ${#models[@]} -eq 0 ]; then
-        echo -e "${RED}✗ No Ollama models found. Install models with: ollama pull <model>${NC}" >&2
-        exit 1
-    fi
-
-    # Display numbered list
-    local i=1
-    for model in "${models[@]}"; do
-        echo "  $i) $model" >&2
-        ((i++))
-    done
-
-    # Prompt for selection
-    echo -n "Select model (1-${#models[@]}): " >&2
-    read -r selection
-
-    # Validate selection
-    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#models[@]} ]; then
-        echo -e "${RED}✗ Invalid selection${NC}" >&2
-        exit 1
-    fi
-
-    # Return selected model (array is 0-indexed)
-    echo "${models[$((selection-1))]}"
-}
-
-# Parse command-line arguments
-# First handle long options
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --minimal)
-            MINIMAL_MODE=true
-            shift
-            ;;
-        --hidethinking)
-            HIDE_THINKING=true
-            shift
-            ;;
-        --thinking)
-            HIDE_THINKING=false
-            shift
-            ;;
-        --no-verify)
-            VERIFY=false
-            shift
-            ;;
-        --)
-            shift
-            break
-            ;;
-        -*)
-            break
-            ;;
-        *)
-            break
-            ;;
-    esac
-done
-
-# Then handle short options
-while getopts "m:f:o:l:h" opt; do
-    case $opt in
-        m) MODEL="$OPTARG" ;;
-        f) INPUT_FILE="$OPTARG" ;;
-        o) OUTPUT="$OPTARG" ;;
-        l) LANG="$OPTARG" ;;
-        h) show_usage; exit 0 ;;
-        \?) echo "Invalid option: -$OPTARG" >&2; show_usage; exit 1 ;;
-    esac
-done
-
-# Shift past the options
-shift $((OPTIND-1))
-
-# Determine input source (priority: file > stdin > argument)
-if [ -n "$INPUT_FILE" ]; then
-    # Read from file
-    if [ ! -f "$INPUT_FILE" ]; then
-        echo -e "${RED}✗ File not found: $INPUT_FILE${NC}" >&2
-        exit 1
-    fi
-    PROMPT=$(cat "$INPUT_FILE")
-elif [ ! -t 0 ]; then
-    # Read from stdin (pipe)
-    PROMPT=$(cat)
-    # If there's also a command-line argument, append it
-    if [ -n "$1" ]; then
-        PROMPT="$1
-
-$PROMPT"
-    fi
-elif [ -n "$1" ]; then
-    # Read from command-line argument
-    PROMPT="$1"
-else
-    echo -e "${RED}✗ No prompt provided${NC}" >&2
-    show_usage
-    exit 1
-fi
-
-# Validate prompt
-if [ -z "$PROMPT" ]; then
-    echo -e "${RED}✗ Empty prompt${NC}" >&2
-    exit 1
-fi
-
-# Verify model exists
-if ! ollama list | grep -q "^$MODEL"; then
-    echo -e "${RED}✗ Model not found: $MODEL${NC}" >&2
-    echo "Available models:" >&2
-    ollama list >&2
-    exit 1
-fi
-
-# Generate unique session ID
-SESSION_ID="pop-$(date +%Y%m%d-%H%M%S)-$$"
-SESSION_LOG="$SESSIONS_DIR/$SESSION_ID.log"
-SESSION_META="$SESSIONS_DIR/$SESSION_ID.meta"
-SESSION_ACTIVE="$ACTIVE_DIR/$SESSION_ID.session"
-
-# Save session metadata
-cat > "$SESSION_META" << EOF
-START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-MODEL_NAME="$MODEL"
-OUTPUT_FILE="$OUTPUT"
-PROMPT_TEXT="$PROMPT"
-STATUS="running"
-END_TIME=""
-ATTEMPTS="0"
-VERIFIED="false"
-EOF
-
-# Background process function
-run_generation() {
-    local session_id="$1"
-    local model="$2"
-    local original_prompt="$3"
-    local output="$4"
-    local lang="$5"
-    local log="$6"
-    local meta="$7"
-    local active="$8"
-    local hide_thinking="$9"
-    local minimal_mode="${10}"
-    local do_verify="${11}"
-    local max_retries="${12}"
-
-    # Write session header to log
-    {
-        echo "=== pop Session: $session_id ==="
-        echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "Model: $model"
-        echo "Output: $output"
-        echo "Verification: $do_verify"
-        echo "Prompt: $original_prompt"
-        echo ""
-    } >> "$log"
-
-    # Build extract-code.py command (use script directory)
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local base_extract_cmd="$SCRIPT_DIR/extract-code.py"
-    if [ -n "$lang" ]; then
-        base_extract_cmd="$base_extract_cmd --lang $lang"
-    fi
-    if [ "$minimal_mode" = "true" ]; then
-        base_extract_cmd="$base_extract_cmd --strip-comments"
-    fi
-
-    # Build ollama options array
-    local ollama_opts=()
-    if [ "$hide_thinking" = "true" ]; then
-        ollama_opts+=(--hidethinking)
-    fi
-
-    # Verification loop
-    local attempt=1
-    local max_attempts=$((max_retries + 1))
-    local status="success"
-    local verified="false"
-    local current_prompt="$original_prompt"
-    local issues=""
-
-    while [ $attempt -le $max_attempts ]; do
-        echo "=== Generation Attempt $attempt/$max_attempts ===" >> "$log"
-
-        # Build enhanced prompt with clear instructions for clean code
-        local enhanced_prompt
-        if [ "$minimal_mode" = "true" ]; then
-            enhanced_prompt="$current_prompt
-
-CRITICAL INSTRUCTIONS:
-- Output ONLY executable code in a single code block
-- NO explanations, NO comments, NO documentation
-- NO text before or after the code block
-- Code must be production-ready and executable immediately"
-        else
-            enhanced_prompt="$current_prompt
-
-IMPORTANT: Respond with ONLY the executable code inside a single code block. No explanations, no comments, no text before or after the code block."
-        fi
-
-        # Run ollama and extract code
-        if ollama run "${ollama_opts[@]}" "$model" "$enhanced_prompt" 2>&1 | tee -a "$log" | $base_extract_cmd > "$output"; then
-            if [ -s "$output" ]; then
-                chmod +x "$output"
-
-                # Skip verification if disabled
-                if [ "$do_verify" != "true" ]; then
-                    echo "" >> "$log"
-                    echo "=== Result (verification skipped) ===" >> "$log"
-                    echo "✓ Script saved to: $output" >> "$log"
-                    verified="skipped"
-                    break
-                fi
-
-                # Detect language for syntax checking
-                local detected_lang=$(detect_language "$output" "$lang")
-                echo "" >> "$log"
-                echo "=== Verification (attempt $attempt) ===" >> "$log"
-                echo "Detected language: $detected_lang" >> "$log"
-
-                # Step 1: Syntax verification
-                local syntax_result=$(verify_syntax "$output" "$detected_lang")
-                if [ -n "$syntax_result" ]; then
-                    echo "✗ Syntax error: $syntax_result" >> "$log"
-                    issues="Syntax error: $syntax_result"
-
-                    if [ $attempt -lt $max_attempts ]; then
-                        current_prompt="$original_prompt
-
-IMPORTANT: Your previous attempt had a syntax error:
-$syntax_result
-
-Please generate COMPLETE, syntactically correct code that compiles/parses without errors."
-                        ((attempt++))
-                        continue
-                    else
-                        echo "✗ Max retries reached with syntax errors" >> "$log"
-                        status="failed"
-                        break
-                    fi
-                fi
-
-                echo "✓ Syntax check passed" >> "$log"
-
-                # Step 2: Completeness verification using the model
-                echo "Running completeness check..." >> "$log"
-                local completeness_result=$(verify_completeness "$model" "$original_prompt" "$output" "$hide_thinking")
-                echo "Completeness result: $completeness_result" >> "$log"
-
-                if echo "$completeness_result" | grep -q '"complete"[[:space:]]*:[[:space:]]*false'; then
-                    issues=$(extract_issues "$completeness_result")
-                    echo "✗ Completeness check failed:" >> "$log"
-                    echo "$issues" >> "$log"
-
-                    if [ $attempt -lt $max_attempts ]; then
-                        current_prompt="$original_prompt
-
-IMPORTANT: Your previous attempt was incomplete or had issues:
-$issues
-
-Please generate a COMPLETE, working implementation that addresses ALL requirements and issues above."
-                        ((attempt++))
-                        continue
-                    else
-                        echo "✗ Max retries reached, accepting best effort" >> "$log"
-                        # Accept the code anyway since syntax is valid
-                        verified="partial"
-                        break
-                    fi
-                fi
-
-                # All checks passed
-                echo "✓ Completeness check passed" >> "$log"
-                verified="true"
-                break
-            else
-                echo "" >> "$log"
-                echo "✗ No code extracted from response" >> "$log"
-                issues="No code block found in response"
-
-                if [ $attempt -lt $max_attempts ]; then
-                    current_prompt="$original_prompt
-
-IMPORTANT: Your previous response did not contain a properly formatted code block.
-Please respond with ONLY executable code inside a markdown code block like:
-\`\`\`python
-# your code here
-\`\`\`"
-                    ((attempt++))
-                    continue
-                else
-                    status="failed"
-                    break
-                fi
-            fi
-        else
-            echo "" >> "$log"
-            echo "✗ Code generation command failed" >> "$log"
-            status="failed"
-            break
-        fi
-    done
-
-    # Final result
-    echo "" >> "$log"
-    echo "=== Final Result ===" >> "$log"
-    echo "Attempts: $attempt" >> "$log"
-    echo "Verified: $verified" >> "$log"
-
-    if [ -s "$output" ] && [ "$status" = "success" ]; then
-        echo "✓ Script saved to: $output" >> "$log"
-        echo "✓ Session log: $log" >> "$log"
-    elif [ -s "$output" ]; then
-        echo "⚠ Script saved with issues to: $output" >> "$log"
-    else
-        echo "✗ No output generated" >> "$log"
-    fi
-
-    # Update metadata with completion status
-    local end_time="$(date '+%Y-%m-%d %H:%M:%S')"
-    sed -i.bak "s/STATUS=\"running\"/STATUS=\"$status\"/" "$meta"
-    sed -i.bak "s/END_TIME=\"\"/END_TIME=\"$end_time\"/" "$meta"
-    sed -i.bak "s/ATTEMPTS=\"0\"/ATTEMPTS=\"$attempt\"/" "$meta"
-    sed -i.bak "s/VERIFIED=\"false\"/VERIFIED=\"$verified\"/" "$meta"
-    rm -f "$meta.bak"
-
-    # Remove from active sessions
-    rm -f "$active"
-}
-
-# Get incremental output filename to avoid overwriting
-OUTPUT=$(get_output_filename "$OUTPUT")
-
-# Update metadata with final output filename
-sed -i.bak "s|OUTPUT_FILE=\".*\"|OUTPUT_FILE=\"$OUTPUT\"|" "$SESSION_META"
-rm -f "$SESSION_META.bak"
-
-# Start background generation
-run_generation "$SESSION_ID" "$MODEL" "$PROMPT" "$OUTPUT" "$LANG" "$SESSION_LOG" "$SESSION_META" "$SESSION_ACTIVE" "$HIDE_THINKING" "$MINIMAL_MODE" "$VERIFY" "$MAX_RETRIES" &
-
-# Get the background process PID and save to active session file
-BG_PID=$!
-echo "$BG_PID" > "$SESSION_ACTIVE"
-
-# Inform user
-echo -e "${GREEN}✓ pop session started: ${BLUE}$SESSION_ID${NC}"
-echo -e "${GREEN}✓ Model: ${BLUE}$MODEL${NC}"
-echo -e "${GREEN}✓ Output will be saved to: ${BLUE}$OUTPUT${NC}"
-if [ "$VERIFY" = "true" ]; then
-    echo -e "${GREEN}✓ Verification: ${BLUE}enabled (max $MAX_RETRIES retries)${NC}"
-else
-    echo -e "${YELLOW}✓ Verification: ${BLUE}disabled${NC}"
-fi
-echo -e "${GREEN}✓ Session log: ${BLUE}$SESSION_LOG${NC}"
-echo ""
-echo -e "${YELLOW}Generation running in background (PID: $BG_PID)${NC}"
-echo -e "${YELLOW}Use 'pop list' to check session status${NC}"
-echo -e "${YELLOW}Use 'tail -f $SESSION_LOG' to follow progress${NC}"
+  pop -fix:./myscript.py "add error handling and fix any syntax errors"
+'''
+    )
+
+    parser.add_argument('-m', '--model', default=DEFAULT_MODEL,
+                        help=f'Select Ollama model (default: {DEFAULT_MODEL})')
+    parser.add_argument('-f', '--file', dest='input_file',
+                        help='Read prompt from file')
+    parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT,
+                        help=f'Output file path (default: {DEFAULT_OUTPUT})')
+    parser.add_argument('-l', '--lang',
+                        help='Language filter for code extraction (python, bash, etc.)')
+    parser.add_argument('--minimal', action='store_true',
+                        help='Enable minimal mode (strongest prompts + strip comments)')
+    parser.add_argument('--thinking', action='store_true',
+                        help='Show model thinking process (hidden by default)')
+    parser.add_argument('--hidethinking', action='store_true',
+                        help='Explicitly hide model thinking process (default behavior)')
+    parser.add_argument('--no-verify', action='store_true', dest='no_verify',
+                        help='Skip output verification (verification enabled by default)')
+    parser.add_argument('prompt', nargs='?', default=None,
+                        help='The prompt for code generation')
+
+    args = parser.parse_args(filtered_args)
+
+    # Determine hide_thinking (default True unless --thinking specified)
+    hide_thinking = not args.thinking
+
+    # Determine verification
+    do_verify = not args.no_verify
+
+    # Determine input source (priority: file > stdin > argument)
+    prompt = None
+
+    if args.input_file:
+        if not Path(args.input_file).exists():
+            print(f"{Colors.RED}✗ File not found: {args.input_file}{Colors.NC}", file=sys.stderr)
+            sys.exit(1)
+        prompt = Path(args.input_file).read_text()
+    elif not sys.stdin.isatty():
+        stdin_content = sys.stdin.read()
+        if args.prompt:
+            prompt = f"{args.prompt}\n\n{stdin_content}"
+        else:
+            prompt = stdin_content
+    elif args.prompt:
+        prompt = args.prompt
+    else:
+        print(f"{Colors.RED}✗ No prompt provided{Colors.NC}", file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    if not prompt or not prompt.strip():
+        print(f"{Colors.RED}✗ Empty prompt{Colors.NC}", file=sys.stderr)
+        sys.exit(1)
+
+    # Verify model exists
+    if not verify_model_exists(args.model):
+        print(f"{Colors.RED}✗ Model not found: {args.model}{Colors.NC}", file=sys.stderr)
+        print("Available models:", file=sys.stderr)
+        subprocess.run(['ollama', 'list'], stderr=sys.stderr)
+        sys.exit(1)
+
+    # Handle fix mode
+    if fix_file:
+        # Validate fix file exists
+        if not Path(fix_file).exists():
+            print(f"{Colors.RED}✗ Fix target file not found: {fix_file}{Colors.NC}", file=sys.stderr)
+            sys.exit(1)
+
+        # Generate output filename: <script>_popfix
+        output = f"{fix_file}_popfix"
+
+        # Generate unique session ID
+        session_id = f"pop-fix-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        session_log = SESSIONS_DIR / f"{session_id}.log"
+        session_meta = SESSIONS_DIR / f"{session_id}.meta"
+        session_active = ACTIVE_DIR / f"{session_id}.session"
+
+        # Detect language from source file
+        lang = args.lang or detect_language(fix_file)
+
+        # Save session metadata
+        with open(session_meta, 'w') as f:
+            f.write(f'START_TIME="{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}"\n')
+            f.write(f'MODEL_NAME="{args.model}"\n')
+            f.write(f'SOURCE_FILE="{fix_file}"\n')
+            f.write(f'OUTPUT_FILE="{output}"\n')
+            f.write(f'PROMPT_TEXT="{prompt}"\n')
+            f.write(f'MODE="fix"\n')
+            f.write('STATUS="running"\n')
+            f.write('END_TIME=""\n')
+            f.write('ATTEMPTS="0"\n')
+            f.write('VERIFIED="false"\n')
+
+        # Start background fix process
+        process = Process(
+            target=run_fix,
+            args=(session_id, args.model, prompt, fix_file, output, lang,
+                  str(session_log), str(session_meta), str(session_active),
+                  hide_thinking, args.minimal, do_verify, MAX_RETRIES)
+        )
+        process.start()
+
+        # Save PID to active session file
+        with open(session_active, 'w') as f:
+            f.write(str(process.pid))
+
+        # Inform user
+        print(f"{Colors.GREEN}✓ pop fix session started: {Colors.BLUE}{session_id}{Colors.NC}")
+        print(f"{Colors.GREEN}✓ Model: {Colors.BLUE}{args.model}{Colors.NC}")
+        print(f"{Colors.GREEN}✓ Fixing: {Colors.BLUE}{fix_file}{Colors.NC}")
+        print(f"{Colors.GREEN}✓ Output will be saved to: {Colors.BLUE}{output}{Colors.NC}")
+        if do_verify:
+            print(f"{Colors.GREEN}✓ Verification: {Colors.BLUE}enabled (max {MAX_RETRIES} retries){Colors.NC}")
+        else:
+            print(f"{Colors.YELLOW}✓ Verification: {Colors.BLUE}disabled{Colors.NC}")
+        print(f"{Colors.GREEN}✓ Session log: {Colors.BLUE}{session_log}{Colors.NC}")
+        print()
+        print(f"{Colors.YELLOW}Fix running in background (PID: {process.pid}){Colors.NC}")
+        print(f"{Colors.YELLOW}Use 'pop list' to check session status{Colors.NC}")
+        print(f"{Colors.YELLOW}Use 'tail -f {session_log}' to follow progress{Colors.NC}")
+
+    else:
+        # Normal generation mode
+        # Generate unique session ID
+        session_id = f"pop-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        session_log = SESSIONS_DIR / f"{session_id}.log"
+        session_meta = SESSIONS_DIR / f"{session_id}.meta"
+        session_active = ACTIVE_DIR / f"{session_id}.session"
+
+        # Get incremental output filename
+        output = get_output_filename(args.output)
+
+        # Save session metadata
+        with open(session_meta, 'w') as f:
+            f.write(f'START_TIME="{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}"\n')
+            f.write(f'MODEL_NAME="{args.model}"\n')
+            f.write(f'OUTPUT_FILE="{output}"\n')
+            f.write(f'PROMPT_TEXT="{prompt}"\n')
+            f.write('STATUS="running"\n')
+            f.write('END_TIME=""\n')
+            f.write('ATTEMPTS="0"\n')
+            f.write('VERIFIED="false"\n')
+
+        # Start background generation
+        process = Process(
+            target=run_generation,
+            args=(session_id, args.model, prompt, output, args.lang,
+                  str(session_log), str(session_meta), str(session_active),
+                  hide_thinking, args.minimal, do_verify, MAX_RETRIES)
+        )
+        process.start()
+
+        # Save PID to active session file
+        with open(session_active, 'w') as f:
+            f.write(str(process.pid))
+
+        # Inform user
+        print(f"{Colors.GREEN}✓ pop session started: {Colors.BLUE}{session_id}{Colors.NC}")
+        print(f"{Colors.GREEN}✓ Model: {Colors.BLUE}{args.model}{Colors.NC}")
+        print(f"{Colors.GREEN}✓ Output will be saved to: {Colors.BLUE}{output}{Colors.NC}")
+        if do_verify:
+            print(f"{Colors.GREEN}✓ Verification: {Colors.BLUE}enabled (max {MAX_RETRIES} retries){Colors.NC}")
+        else:
+            print(f"{Colors.YELLOW}✓ Verification: {Colors.BLUE}disabled{Colors.NC}")
+        print(f"{Colors.GREEN}✓ Session log: {Colors.BLUE}{session_log}{Colors.NC}")
+        print()
+        print(f"{Colors.YELLOW}Generation running in background (PID: {process.pid}){Colors.NC}")
+        print(f"{Colors.YELLOW}Use 'pop list' to check session status{Colors.NC}")
+        print(f"{Colors.YELLOW}Use 'tail -f {session_log}' to follow progress{Colors.NC}")
+
+
+if __name__ == '__main__':
+    main()
